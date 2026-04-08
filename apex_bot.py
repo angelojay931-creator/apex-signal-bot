@@ -1,197 +1,220 @@
-import os
-import time
 import requests
+import time
 import hmac
 import hashlib
 from datetime import datetime
 
 # ── Config ─────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8648873561:AAG07h-OOTh7PuH_EXtiAt0oxiBvIqbHLpI")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "5247767867")
-SCAN_INTERVAL      = 300  # scan every 5 minutes
+TELEGRAM_TOKEN  = "8648873561:AAG07h-OOTh7PuH_EXtiAt0oxiBvIqbHLpI"
+TELEGRAM_CHAT_ID = "5247767867"
 
 COINS = [
-    {"id": "xrp", "gecko_id": "ripple",  "symbol": "XRP/USDT",  "decimals": 4},
-    {"id": "sui", "gecko_id": "sui",     "symbol": "SUI/USDT",  "decimals": 4},
+    {"id": "bitcoin",   "symbol": "BTC", "pair": "BTC/USDT",  "decimals": 0},
+    {"id": "ripple",    "symbol": "XRP", "pair": "XRP/USDT",  "decimals": 4},
+    {"id": "sui",       "symbol": "SUI", "pair": "SUI/USDT",  "decimals": 4},
+    {"id": "solana",    "symbol": "SOL", "pair": "SOL/USDT",  "decimals": 2},
+    {"id": "binancecoin","symbol":"BNB", "pair": "BNB/USDT",  "decimals": 2},
+    {"id": "dogecoin",  "symbol": "DOG", "pair": "DOGE/USDT", "decimals": 5},
 ]
 
-# Track last signal sent to avoid spam
-last_signal = {"xrp": None, "sui": None}
+CONFIDENCE_THRESHOLD = 70   # Only send signals above this %
+CHECK_INTERVAL       = 300  # Check every 5 minutes
+last_signal          = {}   # Track last signal per coin to avoid repeats
 
-# ── Telegram ────────────────────────────────────────────────────────────────
+# ── Telegram ───────────────────────────────────────────────────────────────
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        return res.json()
+        requests.post(url, data=data, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
-        return None
 
-# ── Fetch prices from CoinGecko ─────────────────────────────────────────────
+# ── Fetch prices from CoinGecko ────────────────────────────────────────────
 def fetch_prices():
-    ids  = ",".join([c["gecko_id"] for c in COINS])
-    url  = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_high=true&include_24hr_low=true&include_24hr_vol=true"
+    ids = ",".join([c["id"] for c in COINS])
+    url = (f"https://api.coingecko.com/api/v3/simple/price"
+           f"?ids={ids}&vs_currencies=usd"
+           f"&include_24hr_change=true"
+           f"&include_24hr_high=true"
+           f"&include_24hr_low=true"
+           f"&include_24hr_vol=true")
     try:
-        res  = requests.get(url, timeout=10)
-        data = res.json()
-        prices = {}
-        for coin in COINS:
-            d = data.get(coin["gecko_id"], {})
-            if d:
-                prices[coin["id"]] = {
-                    "price":  d.get("usd", 0),
-                    "change": d.get("usd_24h_change", 0),
-                    "high":   d.get("usd_24h_high", 0),
-                    "low":    d.get("usd_24h_low", 0),
-                    "vol":    d.get("usd_24h_vol", 0),
-                }
-        return prices
+        r = requests.get(url, timeout=10)
+        return r.json()
     except Exception as e:
         print(f"Price fetch error: {e}")
-        return {}
+        return None
 
-# ── Signal engine ───────────────────────────────────────────────────────────
-def compute_signal(data):
-    price  = data["price"]
-    change = data["change"]
-    high   = data["high"] or price * 1.02
-    low    = data["low"]  or price * 0.98
+# ── Signal engine ──────────────────────────────────────────────────────────
+def compute_signal(price, change, high, low, vol):
+    if not price:
+        return None
 
+    high  = high  or price * 1.02
+    low   = low   or price * 0.98
     range_ = high - low
-    pos    = (price - low) / range_ if range_ > 0 else 0.5
+    position = (price - low) / range_ if range_ > 0 else 0.5
 
     score = 0
-    if   change >  4: score += 4
+
+    # Momentum scoring
+    if   change >  6: score += 5
+    elif change >  4: score += 4
     elif change >  2: score += 3
     elif change >  0: score += 1
+    elif change < -6: score -= 5
     elif change < -4: score -= 4
     elif change < -2: score -= 3
     else:             score -= 1
 
-    if   pos < 0.25: score += 2   # near daily low  = potential bounce
-    elif pos > 0.80: score -= 1   # near daily high = possible resistance
+    # Position in range
+    if   position < 0.20: score += 3  # Near bottom = strong buy zone
+    elif position < 0.35: score += 2
+    elif position > 0.85: score -= 2  # Near top = resistance
+    elif position > 0.70: score -= 1
 
-    # Levels
-    if score >= 2:
+    # Volume boost (high volume = stronger signal)
+    if vol and vol > 500_000_000:
+        score += 1
+
+    # Determine signal
+    if score >= 4:
         signal     = "BUY"
-        entry      = price
-        take_profit = round(price * 1.025, 6)
-        stop_loss   = round(price * 0.985, 6)
-        confidence  = min(85, 55 + score * 5)
+        confidence = min(92, 65 + score * 4)
+        tp         = round(price * 1.030, 6)  # 3% take profit
+        sl         = round(price * 0.985, 6)  # 1.5% stop loss
+    elif score >= 2:
+        signal     = "BUY"
+        confidence = min(78, 58 + score * 4)
+        tp         = round(price * 1.020, 6)
+        sl         = round(price * 0.988, 6)
+    elif score <= -4:
+        signal     = "SELL"
+        confidence = min(90, 65 + abs(score) * 4)
+        tp         = round(price * 0.970, 6)
+        sl         = round(price * 1.015, 6)
     elif score <= -2:
         signal     = "SELL"
-        entry      = price
-        take_profit = round(price * 0.975, 6)
-        stop_loss   = round(price * 1.015, 6)
-        confidence  = min(80, 55 + abs(score) * 5)
+        confidence = min(75, 58 + abs(score) * 4)
+        tp         = round(price * 0.980, 6)
+        sl         = round(price * 1.012, 6)
     else:
-        signal     = "HOLD"
-        entry      = price
-        take_profit = round(price * 1.02, 6)
-        stop_loss   = round(price * 0.98, 6)
-        confidence  = 50
+        return None  # HOLD — don't send
 
     return {
-        "signal":      signal,
-        "entry":       entry,
-        "take_profit": take_profit,
-        "stop_loss":   stop_loss,
-        "confidence":  confidence,
-        "score":       score,
-        "change":      change,
+        "signal":     signal,
+        "confidence": confidence,
+        "score":      score,
+        "entry":      price,
+        "tp":         tp,
+        "sl":         sl,
     }
 
-# ── Format Telegram message ─────────────────────────────────────────────────
-def format_message(coin, price_data, sig):
-    now   = datetime.utcnow().strftime("%d %b %Y %H:%M UTC")
-    dec   = coin["decimals"]
-    sym   = coin["symbol"]
-    chg   = price_data["change"]
-    chg_s = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+# ── Format message ─────────────────────────────────────────────────────────
+def format_message(coin, sig, price, change):
+    emoji  = "🟢" if sig["signal"] == "BUY" else "🔴"
+    action = "BUY  — LONG"  if sig["signal"] == "BUY" else "SELL — SHORT"
+    dec    = coin["decimals"]
+    chsign = "+" if change >= 0 else ""
+    time_  = datetime.utcnow().strftime("%H:%M UTC")
 
-    if sig["signal"] == "BUY":
-        emoji  = "🟢"
-        action = "BUY — Place a LONG trade"
-        pionex = "➡️ On Pionex: Buy Market or Limit order"
-    elif sig["signal"] == "SELL":
-        emoji  = "🔴"
-        action = "SELL — Consider closing or avoiding"
-        pionex = "➡️ On Pionex: Sell or wait for reversal"
-    else:
-        emoji  = "🟡"
-        action = "HOLD — No trade yet, monitor closely"
-        pionex = "➡️ On Pionex: Hold current position"
+    # Format prices nicely
+    def fmt(v):
+        if dec == 0: return f"${v:,.0f}"
+        return f"${v:.{dec}f}"
 
-    bar_filled = int(sig["confidence"] / 10)
-    bar        = "█" * bar_filled + "░" * (10 - bar_filled)
+    bars  = "█" * int(sig["confidence"] / 10) + "░" * (10 - int(sig["confidence"] / 10))
 
-    msg = f"""⚡ <b>APEX TRADING SIGNAL</b>
-
-{emoji} <b>{sig['signal']} — {sym}</b>
-📅 {now}
-
-💵 <b>Current Price:</b>  ${sig['entry']:.{dec}f}
-📈 <b>24h Change:</b>     {chg_s}
-
-━━━━━━━━━━━━━━━
-💰 <b>Entry:</b>        ${sig['entry']:.{dec}f}
-🎯 <b>Take Profit:</b>  ${sig['take_profit']:.{dec}f}
-🛑 <b>Stop Loss:</b>    ${sig['stop_loss']:.{dec}f}
-━━━━━━━━━━━━━━━
-
-📊 <b>Confidence:</b> {sig['confidence']}%
-{bar}
-
-{pionex}
-
-⚠️ <i>Not financial advice. Always manage your risk.</i>"""
+    msg = (
+        f"⚡ <b>APEX SIGNAL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>{sig['signal']} — {coin['pair']}</b>\n\n"
+        f"💰 Entry:        {fmt(sig['entry'])}\n"
+        f"🎯 Take Profit:  {fmt(sig['tp'])}\n"
+        f"🛑 Stop Loss:    {fmt(sig['sl'])}\n\n"
+        f"📊 24h Change:   {chsign}{change:.2f}%\n"
+        f"🔥 Confidence:   {sig['confidence']}%\n"
+        f"    {bars}\n\n"
+        f"📱 <i>Place manually on Pionex</i>\n"
+        f"⏰ {time_}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ Not financial advice. DYOR."
+    )
     return msg
 
-# ── Main loop ───────────────────────────────────────────────────────────────
-def main():
-    print("🚀 APEX Signal Bot starting...")
-    send_telegram("🚀 <b>APEX Signal Bot is now ONLINE</b>\n\nMonitoring XRP/USDT and SUI/USDT\nYou'll receive signals every time there's a strong BUY or SELL opportunity.\n\n⚡ Scanning every 5 minutes...")
+# ── Main loop ──────────────────────────────────────────────────────────────
+def run():
+    print("🚀 APEX Trading Signal Bot started")
+    print(f"📊 Monitoring: {', '.join([c['symbol'] for c in COINS])}")
+    print(f"🎯 Min confidence: {CONFIDENCE_THRESHOLD}%")
+    print(f"⏱  Check interval: {CHECK_INTERVAL}s\n")
+
+    send_telegram(
+        "🚀 <b>APEX Signal Bot Online</b>\n\n"
+        f"Monitoring: BTC · XRP · SUI · SOL · BNB · DOGE\n"
+        f"Min confidence: {CONFIDENCE_THRESHOLD}%\n"
+        "Only strong signals will be sent. 💪"
+    )
 
     while True:
-        print(f"\n[{datetime.utcnow().strftime('%H:%M:%S')}] Scanning markets...")
-        prices = fetch_prices()
+        try:
+            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Scanning markets...")
+            prices = fetch_prices()
 
-        if not prices:
-            print("No price data — retrying in 60s")
-            time.sleep(60)
-            continue
-
-        for coin in COINS:
-            cid  = coin["id"]
-            data = prices.get(cid)
-            if not data or not data["price"]:
-                print(f"  {cid.upper()}: no data")
+            if not prices:
+                print("  ⚠ Price fetch failed, retrying...")
+                time.sleep(60)
                 continue
 
-            sig = compute_signal(data)
-            print(f"  {cid.upper()}: ${data['price']:.4f} | {sig['signal']} (score:{sig['score']}, conf:{sig['confidence']}%)")
+            signals_sent = 0
 
-            # Only send BUY or SELL signals — skip HOLD to avoid spam
-            # Also avoid sending same signal twice in a row
-            if sig["signal"] in ("BUY", "SELL") and last_signal[cid] != sig["signal"]:
-                msg = format_message(coin, data, sig)
-                result = send_telegram(msg)
-                if result and result.get("ok"):
-                    print(f"  ✅ Signal sent to Telegram: {sig['signal']} {cid.upper()}")
-                    last_signal[cid] = sig["signal"]
-                else:
-                    print(f"  ⚠ Telegram send failed: {result}")
-            else:
-                print(f"  ⏳ {cid.upper()} HOLD or repeat signal — not sending")
+            for coin in COINS:
+                d = prices.get(coin["id"], {})
+                if not d:
+                    continue
 
-        print(f"  Next scan in {SCAN_INTERVAL//60} minutes...")
-        time.sleep(SCAN_INTERVAL)
+                price  = d.get("usd")
+                change = d.get("usd_24h_change", 0) or 0
+                high   = d.get("usd_24h_high")
+                low    = d.get("usd_24h_low")
+                vol    = d.get("usd_24h_vol")
+
+                if not price:
+                    continue
+
+                sig = compute_signal(price, change, high, low, vol)
+
+                if not sig:
+                    print(f"  {coin['symbol']}: HOLD (no strong signal)")
+                    continue
+
+                if sig["confidence"] < CONFIDENCE_THRESHOLD:
+                    print(f"  {coin['symbol']}: {sig['signal']} but confidence too low ({sig['confidence']}%)")
+                    continue
+
+                # Avoid sending same signal twice in a row
+                prev = last_signal.get(coin["symbol"])
+                if prev and prev["signal"] == sig["signal"] and abs(prev["entry"] - price) / price < 0.005:
+                    print(f"  {coin['symbol']}: Same signal as last time, skipping")
+                    continue
+
+                # Send it!
+                msg = format_message(coin, sig, price, change)
+                send_telegram(msg)
+                last_signal[coin["symbol"]] = sig
+                signals_sent += 1
+                print(f"  ✅ {coin['symbol']}: {sig['signal']} signal sent! Confidence: {sig['confidence']}%")
+                time.sleep(1)  # Small delay between messages
+
+            if signals_sent == 0:
+                print(f"  No strong signals this cycle.")
+
+        except Exception as e:
+            print(f"  Error: {e}")
+
+        print(f"  Sleeping {CHECK_INTERVAL}s...\n")
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    run()
