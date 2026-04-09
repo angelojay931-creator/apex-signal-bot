@@ -6,6 +6,7 @@ import hashlib
 from datetime import datetime
 import json
 
+# Config
 TELEGRAM_TOKEN = "8648873561:AAG07h-OOTh7PuH_EXtiAt0oxiBvIqbHLpI"
 TELEGRAM_CHAT_ID = "5247767867"
 PIONEX_API_KEY = os.environ.get("PIONEX_API_KEY", "")
@@ -189,14 +190,14 @@ def handle_callback(cb, offset):
     parts = data.split("_")
     action = parts[0] if parts else ""
     symbol = parts[1] if len(parts) > 1 else ""
-    print("Button pressed: " + action + " " + symbol)
+    print("Button: " + action + " " + symbol)
     if action == "CONFIRM" and symbol in pending_trades:
         trade = pending_trades.pop(symbol)
         answer_callback(cb_id, "Placing order...")
         qty = round(TRADE_SIZE_USDT / trade["price"], trade["qty_dec"])
-        print("Placing order: " + symbol + " qty=" + str(qty) + " price=" + str(trade["price"]))
+        print("Order: " + symbol + " qty=" + str(qty) + " price=" + str(trade["price"]))
         result = place_order(trade["pionex"], "BUY", trade["price"], qty, trade["qty_dec"])
-        print("Order result: " + str(result))
+        print("Result: " + str(result))
         if result and not result.get("error") and result.get("result"):
             open_positions[symbol] = {
                 "entry": trade["price"],
@@ -216,14 +217,13 @@ def handle_callback(cb, offset):
             )
         else:
             err = result.get("message") or result.get("error") or str(result)
-            print("Order failed: " + str(err))
             send_telegram("<b>Order failed</b>\n\n" + str(err) + "\n\nPlace manually on Pionex.")
     elif action == "SKIP" and symbol in pending_trades:
         pending_trades.pop(symbol, None)
         answer_callback(cb_id, "Skipped")
         send_telegram("Skipped " + symbol + " - waiting for next signal.")
     else:
-        print("Unknown action or symbol not in pending: " + action + " " + symbol)
+        answer_callback(cb_id, "Signal expired - wait for next one")
 
 def check_updates(offset):
     updates = get_updates(offset)
@@ -236,11 +236,11 @@ def check_updates(offset):
     return offset
 
 def run():
-    print("APEX Semi-Auto Trading Bot started")
-    print("API Key loaded: " + str(len(PIONEX_API_KEY)) + " chars")
-    print("Secret loaded: " + str(len(PIONEX_SECRET)) + " chars")
+    print("APEX Bot v3 started")
+    print("API Key: " + str(len(PIONEX_API_KEY)) + " chars")
+    print("Secret: " + str(len(PIONEX_SECRET)) + " chars")
     send_telegram(
-        "<b>APEX Bot Online!</b>\n\n"
+        "<b>APEX Bot Online v3!</b>\n\n"
         "Monitoring: XRP, SUI, BTC, SOL, BNB, DOGE\n"
         "Min confidence: " + str(CONFIDENCE_THRESHOLD) + "%\n"
         "Trade size: $" + str(TRADE_SIZE_USDT) + " USDT\n\n"
@@ -250,10 +250,8 @@ def run():
     scan_counter = 0
 
     while True:
-        # Check button presses every loop
         offset = check_updates(offset)
 
-        # Check open positions
         if open_positions:
             prices = fetch_prices()
             if prices:
@@ -268,20 +266,19 @@ def run():
                     pos = open_positions[sym]
                     if price >= pos["tp"]:
                         pnl = round((pos["tp"] - pos["entry"]) * pos["qty"], 2)
-                        send_telegram("<b>TAKE PROFIT HIT!</b>\n\n" + sym + " closed @ $" + str(pos["tp"]) + "\nProfit: +$" + str(pnl) + " USDT")
+                        send_telegram("<b>TAKE PROFIT HIT!</b>\n\n" + sym + " @ $" + str(pos["tp"]) + "\nProfit: +$" + str(pnl) + " USDT")
                         place_order(pos["pionex"], "SELL", pos["tp"], pos["qty"], pos["qty_dec"])
                         del open_positions[sym]
                     elif price <= pos["sl"]:
                         loss = round((pos["sl"] - pos["entry"]) * pos["qty"], 2)
-                        send_telegram("<b>STOP LOSS HIT</b>\n\n" + sym + " closed @ $" + str(pos["sl"]) + "\nLoss: $" + str(loss) + " USDT")
+                        send_telegram("<b>STOP LOSS HIT</b>\n\n" + sym + " @ $" + str(pos["sl"]) + "\nLoss: $" + str(loss) + " USDT")
                         place_order(pos["pionex"], "SELL", pos["sl"], pos["qty"], pos["qty_dec"])
                         del open_positions[sym]
 
-        # Scan markets every 5 minutes
         scan_counter += 1
         if scan_counter >= 30:
             scan_counter = 0
-            print("[" + datetime.utcnow().strftime("%H:%M:%S") + "] Scanning markets...")
+            print("[" + datetime.utcnow().strftime("%H:%M:%S") + "] Scanning...")
             prices = fetch_prices()
             if prices:
                 for coin in COINS:
@@ -298,14 +295,10 @@ def run():
                         continue
                     print(sym + ": $" + str(price) + " | " + str(round(change, 2)) + "%")
                     sig = compute_signal(price, change, high, low, vol)
-                    if not sig:
-                        print(sym + ": HOLD")
-                        continue
-                    if sig["confidence"] < CONFIDENCE_THRESHOLD:
+                    if not sig or sig["confidence"] < CONFIDENCE_THRESHOLD:
                         continue
                     prev = last_signal.get(sym)
                     if prev and prev["signal"] == sig["signal"] and price and abs(prev.get("entry", 0) - price) / price < 0.005:
-                        print(sym + ": same signal - skipping")
                         continue
                     sig["entry"] = price
                     last_signal[sym] = sig
@@ -324,7 +317,7 @@ def run():
                         ]]
                     }
                     send_telegram(msg, reply_markup=markup)
-                    print(sym + ": " + sig["signal"] + " signal sent! " + str(sig["confidence"]) + "%")
+                    print(sym + ": " + sig["signal"] + " sent! " + str(sig["confidence"]) + "%")
 
         time.sleep(10)
 
