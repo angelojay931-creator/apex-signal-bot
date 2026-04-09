@@ -56,17 +56,17 @@ def tg_updates(offset=None):
     except:
         return None
 
-def px_sign(secret, params):
-    s = "&".join(str(k) + "=" + str(v) for k, v in sorted(params.items()))
-    return hmac.new(secret.encode(), s.encode(), hashlib.sha256).hexdigest()
-
 def px_order(symbol, side, price, qty, qdec):
     try:
         ts = str(int(time.time() * 1000))
         params = {"symbol":symbol,"side":side,"type":"LIMIT","price":str(round(price,6)),"size":str(round(qty,qdec)),"timeInForce":"GTC","timestamp":ts}
-        params["signature"] = px_sign(PX_SEC, params)
-        headers = {"X-PIONEX-KEY": PX_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-        r = requests.post("https://api.pionex.com/api/v1/trade/order", data=params, headers=headers, timeout=10)
+        sorted_params = "&".join(str(k) + "=" + str(v) for k, v in sorted(params.items()))
+        path = "/api/v1/trade/order"
+        to_sign = "POST" + path + "?" + sorted_params
+        sig = hmac.new(PX_SEC.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        headers = {"PIONEX-KEY": PX_KEY, "Content-Type": "application/json"}
+        r = requests.post("https://api.pionex.com" + path, json=params, headers=headers, timeout=10)
         return r.json()
     except Exception as e:
         return {"error": str(e)}
@@ -194,13 +194,13 @@ def check_btns(offset):
     return offset
 
 def run():
-    print("APEX Bot v4 started")
+    print("APEX Bot v5 started")
     print("TG Token: " + str(len(TG_TOKEN)) + " chars")
     print("TG Chat: " + str(len(TG_CHAT)) + " chars")
     print("API Key: " + str(len(PX_KEY)) + " chars")
     print("Secret: " + str(len(PX_SEC)) + " chars")
     tg_send(
-        "<b>APEX Bot v4 Online!</b>\n\n"
+        "<b>APEX Bot v5 Online!</b>\n\n"
         "Monitoring: XRP, SUI, BTC, SOL, BNB, DOGE\n"
         "Min confidence: " + str(MIN_CONF) + "%\n"
         "Trade size: $" + str(TRADE_SIZE) + " USDT\n\n"
