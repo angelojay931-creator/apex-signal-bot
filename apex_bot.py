@@ -1,3 +1,4 @@
+import os
 import requests
 import time
 import hmac
@@ -7,8 +8,8 @@ import json
 
 TELEGRAM_TOKEN = "8648873561:AAG07h-OOTh7PuH_EXtiAt0oxiBvIqbHLpI"
 TELEGRAM_CHAT_ID = "5247767867"
-PIONEX_API_KEY = "9fFe42LKbokar2qu1NoSQbVsQzbFFiS7w8RsVuBzqP2hdB4EG9GQjAPLgXMChZNZc3"
-PIONEX_SECRET = "8pVokBaQY1CUeznWidI5YIhfogeshtyvqgxkwh3gffqXVgJg0cGOv4AQAxnKkr3C"
+PIONEX_API_KEY = os.environ.get("PIONEX_API_KEY", "")
+PIONEX_SECRET = os.environ.get("PIONEX_SECRET", "")
 TRADE_SIZE_USDT = 10
 CONFIDENCE_THRESHOLD = 65
 CHECK_INTERVAL = 300
@@ -184,6 +185,8 @@ def format_signal(coin, sig, price, change):
 
 def run():
     print("APEX Semi-Auto Trading Bot started")
+    print("API Key loaded: " + str(len(PIONEX_API_KEY)) + " chars")
+    print("Secret loaded: " + str(len(PIONEX_SECRET)) + " chars")
     send_telegram(
         "<b>APEX Bot Online!</b>\n\n"
         "Monitoring: XRP, SUI, BTC, SOL, BNB, DOGE\n"
