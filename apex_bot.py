@@ -8,8 +8,8 @@ import json
 
 # Config
 TELEGRAM_TOKEN = "8648873561:AAG07h-OOTh7PuH_EXtiAt0oxiBvIqbHLpI"
-TELEGRAM_CHAT_ID = "5247767867"
-PIONEX_API_KEY = os.environ.get("PIONEX_API_KEY", "")
+PIONEX_API_KEY = os.environ.get("P_API_KEY", "")
+PIONEX_SECRET = os.environ.get("P_SECRET", "")
 PIONEX_SECRET = os.environ.get("PIONEX_SECRET", "")
 TRADE_SIZE_USDT = 10
 CONFIDENCE_THRESHOLD = 65
