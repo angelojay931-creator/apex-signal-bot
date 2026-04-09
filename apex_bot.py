@@ -48,11 +48,11 @@ def answer_callback(callback_id, text):
 
 def get_updates(offset=None):
     url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/getUpdates"
-    params = {"timeout": 5, "allowed_updates": ["callback_query"]}
+    params = {"timeout": 1, "allowed_updates": ["callback_query"]}
     if offset:
         params["offset"] = offset
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=5)
         return r.json()
     except:
         return None
@@ -183,6 +183,58 @@ def format_signal(coin, sig, price, change):
     )
     return msg
 
+def handle_callback(cb, offset):
+    data = cb.get("data", "")
+    cb_id = cb["id"]
+    parts = data.split("_")
+    action = parts[0] if parts else ""
+    symbol = parts[1] if len(parts) > 1 else ""
+    print("Button pressed: " + action + " " + symbol)
+    if action == "CONFIRM" and symbol in pending_trades:
+        trade = pending_trades.pop(symbol)
+        answer_callback(cb_id, "Placing order...")
+        qty = round(TRADE_SIZE_USDT / trade["price"], trade["qty_dec"])
+        print("Placing order: " + symbol + " qty=" + str(qty) + " price=" + str(trade["price"]))
+        result = place_order(trade["pionex"], "BUY", trade["price"], qty, trade["qty_dec"])
+        print("Order result: " + str(result))
+        if result and not result.get("error") and result.get("result"):
+            open_positions[symbol] = {
+                "entry": trade["price"],
+                "tp": trade["tp"],
+                "sl": trade["sl"],
+                "qty": qty,
+                "pionex": trade["pionex"],
+                "qty_dec": trade["qty_dec"],
+            }
+            send_telegram(
+                "<b>ORDER PLACED!</b>\n\n"
+                + symbol + "/USDT BUY @ $" + str(trade["price"]) + "\n"
+                + "TP: $" + str(trade["tp"]) + "\n"
+                + "SL: $" + str(trade["sl"]) + "\n"
+                + "Size: $" + str(TRADE_SIZE_USDT) + " USDT\n\n"
+                + "Monitoring automatically..."
+            )
+        else:
+            err = result.get("message") or result.get("error") or str(result)
+            print("Order failed: " + str(err))
+            send_telegram("<b>Order failed</b>\n\n" + str(err) + "\n\nPlace manually on Pionex.")
+    elif action == "SKIP" and symbol in pending_trades:
+        pending_trades.pop(symbol, None)
+        answer_callback(cb_id, "Skipped")
+        send_telegram("Skipped " + symbol + " - waiting for next signal.")
+    else:
+        print("Unknown action or symbol not in pending: " + action + " " + symbol)
+
+def check_updates(offset):
+    updates = get_updates(offset)
+    if updates and updates.get("ok"):
+        for update in updates.get("result", []):
+            offset = update["update_id"] + 1
+            cb = update.get("callback_query")
+            if cb:
+                handle_callback(cb, offset)
+    return offset
+
 def run():
     print("APEX Semi-Auto Trading Bot started")
     print("API Key loaded: " + str(len(PIONEX_API_KEY)) + " chars")
@@ -192,51 +244,16 @@ def run():
         "Monitoring: XRP, SUI, BTC, SOL, BNB, DOGE\n"
         "Min confidence: " + str(CONFIDENCE_THRESHOLD) + "%\n"
         "Trade size: $" + str(TRADE_SIZE_USDT) + " USDT\n\n"
-        "Signals coming with CONFIRM and SKIP buttons!"
+        "Signals with CONFIRM and SKIP buttons!"
     )
     offset = None
+    scan_counter = 0
+
     while True:
-        updates = get_updates(offset)
-        if updates and updates.get("ok"):
-            for update in updates.get("result", []):
-                offset = update["update_id"] + 1
-                cb = update.get("callback_query")
-                if not cb:
-                    continue
-                data = cb.get("data", "")
-                cb_id = cb["id"]
-                parts = data.split("_")
-                action = parts[0] if parts else ""
-                symbol = parts[1] if len(parts) > 1 else ""
-                if action == "CONFIRM" and symbol in pending_trades:
-                    trade = pending_trades.pop(symbol)
-                    answer_callback(cb_id, "Placing order on Pionex...")
-                    qty = round(TRADE_SIZE_USDT / trade["price"], trade["qty_dec"])
-                    result = place_order(trade["pionex"], "BUY", trade["price"], qty, trade["qty_dec"])
-                    if result and not result.get("error") and result.get("result"):
-                        open_positions[symbol] = {
-                            "entry": trade["price"],
-                            "tp": trade["tp"],
-                            "sl": trade["sl"],
-                            "qty": qty,
-                            "pionex": trade["pionex"],
-                            "qty_dec": trade["qty_dec"],
-                        }
-                        send_telegram(
-                            "<b>ORDER PLACED!</b>\n\n"
-                            + symbol + "/USDT BUY @ $" + str(trade["price"]) + "\n"
-                            + "TP: $" + str(trade["tp"]) + "\n"
-                            + "SL: $" + str(trade["sl"]) + "\n"
-                            + "Size: $" + str(TRADE_SIZE_USDT) + " USDT\n\n"
-                            + "Monitoring position automatically..."
-                        )
-                    else:
-                        err = result.get("message") or result.get("error") or "Unknown"
-                        send_telegram("<b>Order failed</b>\n\n" + str(err) + "\n\nPlace manually on Pionex.")
-                elif action == "SKIP" and symbol in pending_trades:
-                    pending_trades.pop(symbol, None)
-                    answer_callback(cb_id, "Skipped")
-                    send_telegram("Skipped " + symbol + " - waiting for next signal.")
+        # Check button presses every loop
+        offset = check_updates(offset)
+
+        # Check open positions
         if open_positions:
             prices = fetch_prices()
             if prices:
@@ -251,73 +268,65 @@ def run():
                     pos = open_positions[sym]
                     if price >= pos["tp"]:
                         pnl = round((pos["tp"] - pos["entry"]) * pos["qty"], 2)
-                        send_telegram(
-                            "<b>TAKE PROFIT HIT!</b>\n\n"
-                            + sym + "/USDT closed @ $" + str(pos["tp"]) + "\n"
-                            + "Profit: +$" + str(pnl) + " USDT"
-                        )
+                        send_telegram("<b>TAKE PROFIT HIT!</b>\n\n" + sym + " closed @ $" + str(pos["tp"]) + "\nProfit: +$" + str(pnl) + " USDT")
                         place_order(pos["pionex"], "SELL", pos["tp"], pos["qty"], pos["qty_dec"])
                         del open_positions[sym]
                     elif price <= pos["sl"]:
                         loss = round((pos["sl"] - pos["entry"]) * pos["qty"], 2)
-                        send_telegram(
-                            "<b>STOP LOSS HIT</b>\n\n"
-                            + sym + "/USDT closed @ $" + str(pos["sl"]) + "\n"
-                            + "Loss: $" + str(loss) + " USDT\n\nPosition protected."
-                        )
+                        send_telegram("<b>STOP LOSS HIT</b>\n\n" + sym + " closed @ $" + str(pos["sl"]) + "\nLoss: $" + str(loss) + " USDT")
                         place_order(pos["pionex"], "SELL", pos["sl"], pos["qty"], pos["qty_dec"])
                         del open_positions[sym]
-        print("[" + datetime.utcnow().strftime("%H:%M:%S") + "] Scanning markets...")
-        prices = fetch_prices()
-        if not prices:
-            print("No price data - retrying in 60s")
-            time.sleep(60)
-            continue
-        for coin in COINS:
-            sym = coin["symbol"]
-            if sym in open_positions or sym in pending_trades:
-                continue
-            d = prices.get(coin["id"], {})
-            price = d.get("usd")
-            change = d.get("usd_24h_change", 0) or 0
-            high = d.get("usd_24h_high")
-            low = d.get("usd_24h_low")
-            vol = d.get("usd_24h_vol")
-            if not price:
-                print(sym + ": no price")
-                continue
-            print(sym + ": $" + str(price) + " | " + str(round(change, 2)) + "%")
-            sig = compute_signal(price, change, high, low, vol)
-            if not sig:
-                print(sym + ": HOLD")
-                continue
-            if sig["confidence"] < CONFIDENCE_THRESHOLD:
-                print(sym + ": low confidence " + str(sig["confidence"]) + "%")
-                continue
-            prev = last_signal.get(sym)
-            if prev and prev["signal"] == sig["signal"] and price and abs(prev.get("entry", 0) - price) / price < 0.005:
-                print(sym + ": same signal - skipping")
-                continue
-            sig["entry"] = price
-            last_signal[sym] = sig
-            pending_trades[sym] = {
-                "price": price,
-                "tp": sig["tp"],
-                "sl": sig["sl"],
-                "pionex": coin["pionex"],
-                "qty_dec": coin["qty_dec"],
-            }
-            msg = format_signal(coin, sig, price, change)
-            markup = {
-                "inline_keyboard": [[
-                    {"text": "CONFIRM TRADE", "callback_data": "CONFIRM_" + sym},
-                    {"text": "SKIP", "callback_data": "SKIP_" + sym}
-                ]]
-            }
-            send_telegram(msg, reply_markup=markup)
-            print(sym + ": " + sig["signal"] + " signal sent! " + str(sig["confidence"]) + "%")
-        print("Next scan in " + str(CHECK_INTERVAL) + "s")
-        time.sleep(CHECK_INTERVAL)
+
+        # Scan markets every 5 minutes
+        scan_counter += 1
+        if scan_counter >= 30:
+            scan_counter = 0
+            print("[" + datetime.utcnow().strftime("%H:%M:%S") + "] Scanning markets...")
+            prices = fetch_prices()
+            if prices:
+                for coin in COINS:
+                    sym = coin["symbol"]
+                    if sym in open_positions or sym in pending_trades:
+                        continue
+                    d = prices.get(coin["id"], {})
+                    price = d.get("usd")
+                    change = d.get("usd_24h_change", 0) or 0
+                    high = d.get("usd_24h_high")
+                    low = d.get("usd_24h_low")
+                    vol = d.get("usd_24h_vol")
+                    if not price:
+                        continue
+                    print(sym + ": $" + str(price) + " | " + str(round(change, 2)) + "%")
+                    sig = compute_signal(price, change, high, low, vol)
+                    if not sig:
+                        print(sym + ": HOLD")
+                        continue
+                    if sig["confidence"] < CONFIDENCE_THRESHOLD:
+                        continue
+                    prev = last_signal.get(sym)
+                    if prev and prev["signal"] == sig["signal"] and price and abs(prev.get("entry", 0) - price) / price < 0.005:
+                        print(sym + ": same signal - skipping")
+                        continue
+                    sig["entry"] = price
+                    last_signal[sym] = sig
+                    pending_trades[sym] = {
+                        "price": price,
+                        "tp": sig["tp"],
+                        "sl": sig["sl"],
+                        "pionex": coin["pionex"],
+                        "qty_dec": coin["qty_dec"],
+                    }
+                    msg = format_signal(coin, sig, price, change)
+                    markup = {
+                        "inline_keyboard": [[
+                            {"text": "CONFIRM TRADE", "callback_data": "CONFIRM_" + sym},
+                            {"text": "SKIP", "callback_data": "SKIP_" + sym}
+                        ]]
+                    }
+                    send_telegram(msg, reply_markup=markup)
+                    print(sym + ": " + sig["signal"] + " signal sent! " + str(sig["confidence"]) + "%")
+
+        time.sleep(10)
 
 if __name__ == "__main__":
     run()
