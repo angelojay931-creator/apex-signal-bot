@@ -17,7 +17,7 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 PX_KEY = os.environ.get("P_API_KEY", "").strip()
 PX_SEC = os.environ.get("P_SECRET", "").strip()
 
-TRADE_SIZE = Decimal("15")
+TRADE_SIZE = Decimal("25")
 MIN_CONF = 65
 SCAN_EVERY_SECONDS = 30
 PRICE_TIMEOUT = 15
