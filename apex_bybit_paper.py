@@ -16,107 +16,61 @@ Railway env vars needed (paper mode):
 """
 
 import os
-import json
 import time
-import hmac
-import hashlib
 import threading
-from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, jsonify
 
-# ─────────────────────────── FLASK API ────────────────────────
-app = Flask(__name__)
-
-@app.route("/")
-def health():
-    return "APEX Paper Bot running!", 200
-
-@app.route("/data")
-def get_data():
-    """Dashboard reads from this endpoint."""
-    net_pnl  = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-    win_rate = round(stats["tp_hit"] / stats["total"] * 100, 1) if stats["total"] > 0 else 0
-
-    open_pos = {}
-    for sym, pos in positions.items():
-        open_pos[sym] = {
-            "sym":       sym,
-            "direction": pos["direction"],
-            "entry":     pos["entry"],
-            "tp1":       pos["tp1"],
-            "tp2":       pos["tp2"],
-            "tp3":       pos["tp3"],
-            "tp4":       pos["tp4"],
-            "sl":        pos["sl"],
-            "tpHit":     pos["tp_hit"],
-            "breakeven": pos.get("breakeven", False),
-            "margin":    pos.get("margin", float(TRADE_SIZE)),
-            "currentPnl": pos.get("currentPnl", 0),
-            "openTime":  pos.get("opened_at", 0),
-        }
-
-    response = jsonify({
-        "balance":       paper_balance,
-        "startBalance":  PAPER_BALANCE,
-        "netPnl":        net_pnl,
-        "winRate":       win_rate,
-        "totalTrades":   stats["total"],
-        "tpHits":        stats["tp_hit"],
-        "slHits":        stats["sl_hit"],
-        "profitUsdt":    stats["profit_usdt"],
-        "lossUsdt":      stats["loss_usdt"],
-        "openPositions": open_pos,
-        "closedTrades":  stats.get("trades_list", [])[-50:],
-        "pnlHistory":    stats.get("pnl_history", [PAPER_BALANCE]),
-        "leverage":      LEVERAGE,
-        "tradeSize":     float(TRADE_SIZE),
-        "timestamp":     utc_now_str(),
-    })
-    response.headers.add("Access-Control-Allow-Origin", "*")
-    return response
-
-def start_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-
-PAPER_TRADING = True           # ← Flip to False for real money
-PAPER_BALANCE = 200.0          # Simulated starting USDT balance
+# ─────────────────────────── CONFIG ───────────────────────────
+PAPER_TRADING  = True
+PAPER_BALANCE  = 200.0
 
 BYBIT_KEY    = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_SECRET = os.environ.get("BYBIT_SECRET", "").strip()
 TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-TRADE_SIZE         = Decimal("25")   # USDT margin per trade
-LEVERAGE           = 3               # 3x leverage
+TRADE_SIZE         = 25.0
+USE_DYNAMIC_SIZING = True
+RISK_PCT           = 0.10
+MIN_TRADE_SIZE     = 10.0
+MAX_TRADE_SIZE     = 50.0
+
+LEVERAGE           = 3
 MIN_CONF           = 85
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
 MAX_OPEN_TRADES    = 5
 
+SLIPPAGE_PCT       = 0.001
+FUNDING_RATE       = 0.0001
+PRE_WARN_TTL       = 7200
+
 BLOCKED_COINS = {"ENJ"}
 
 # ─────────────────────────── STATE ────────────────────────────
-last_signal = {}
-positions   = {}   # active simulated positions
-watching    = {}   # signals being tracked
-pre_warned  = {}
+# RLock: reentrant — make_tp_msg/make_sl_msg re-acquire inside monitor_positions
+state_lock    = threading.RLock()
 
-paper_balance = PAPER_BALANCE  # current simulated balance
+positions     = {}
+pre_warned    = {}   # {sym: timestamp}
+paper_balance = PAPER_BALANCE
 
 stats = {
-    "total":        0,
-    "tp_hit":       0,
-    "sl_hit":       0,
-    "profit_usdt":  0.0,
-    "loss_usdt":    0.0,
-    "trades_list":  [],
-    "pnl_history":  [],
+    "total":       0,
+    "trades_won":  0,
+    "tp_hit":      0,
+    "sl_hit":      0,
+    "profit_usdt": 0.0,
+    "loss_usdt":   0.0,
+    "trades_list": [],
+    "pnl_history": [PAPER_BALANCE],
 }
+
+last_signal = {}
 
 # ─────────────────────────── COINS ────────────────────────────
 COINS = [
@@ -203,12 +157,22 @@ def fmt_p(price, decimals=None):
     if price is None:
         return "N/A"
     if decimals is None:
-        if price >= 1000: decimals = 1
-        elif price >= 100: decimals = 2
-        elif price >= 1:   decimals = 4
-        elif price >= 0.01: decimals = 5
-        else:               decimals = 8
+        if price >= 1000:    decimals = 1
+        elif price >= 100:   decimals = 2
+        elif price >= 1:     decimals = 4
+        elif price >= 0.01:  decimals = 5
+        else:                decimals = 8
     return f"${price:.{decimals}f}"
+
+
+def calc_trade_size():
+    """Return margin for this trade — dynamic or fixed."""
+    if USE_DYNAMIC_SIZING:
+        with state_lock:
+            bal = paper_balance
+        sized = round(bal * RISK_PCT, 2)
+        return max(MIN_TRADE_SIZE, min(MAX_TRADE_SIZE, sized))
+    return TRADE_SIZE
 
 
 # ──────────────────────── RSI / EMA ───────────────────────────
@@ -277,6 +241,19 @@ def get_ta(symbol):
     }
 
 
+def fetch_ta_parallel(symbols):
+    results = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        future_map = {ex.submit(get_ta, sym): sym for sym in symbols}
+        for future in as_completed(future_map):
+            sym = future_map[future]
+            try:
+                results[sym] = future.result()
+            except Exception:
+                results[sym] = None
+    return results
+
+
 # ──────────────────────── PRICES ──────────────────────────────
 def get_prices():
     try:
@@ -323,9 +300,9 @@ def get_prices():
 # ──────────────────────── SIGNAL ENGINE ───────────────────────
 def calc_levels(price, direction, rsi, vol_ratio):
     base = 0.025
-    if vol_ratio and vol_ratio > 3:    base = 0.042
-    elif vol_ratio and vol_ratio > 2:  base = 0.034
-    elif rsi and (rsi < 25 or rsi > 75): base = 0.036
+    if vol_ratio and vol_ratio > 3:       base = 0.042
+    elif vol_ratio and vol_ratio > 2:     base = 0.034
+    elif rsi and (rsi < 25 or rsi > 75):  base = 0.036
 
     if direction == "BUY":
         tp1 = round(price * (1 + base * 0.40), 8)
@@ -358,15 +335,16 @@ def build_signal(price, change, high, low, vol, ta):
     pos  = (price - low) / rng if rng > 0 else 0.5
     score = 0
 
-    if change > 8:    score += 6
-    elif change > 6:  score += 5
-    elif change > 4:  score += 4
-    elif change > 2:  score += 2
+    if change > 8:     score += 6
+    elif change > 6:   score += 5
+    elif change > 4:   score += 4
+    elif change > 2:   score += 2
     elif change < -8:  score -= 6
     elif change < -6:  score -= 5
     elif change < -4:  score -= 4
     elif change < -2:  score -= 2
-    else: return None
+    else:
+        return None
 
     if pos < 0.15:   score += 4
     elif pos < 0.25: score += 3
@@ -407,13 +385,13 @@ def build_signal(price, change, high, low, vol, ta):
         score = score + 1 if score > 0 else score - 1
 
     if score >= 7:
-        conf = min(95, 70 + score * 3); direction = "BUY"
+        conf = min(95, 70 + score * 3);      direction = "BUY"
     elif score >= 5:
-        conf = min(88, 65 + score * 3); direction = "BUY"
+        conf = min(88, 75 + score * 2);      direction = "BUY"
     elif score <= -7:
         conf = min(95, 70 + abs(score) * 3); direction = "SELL"
     elif score <= -5:
-        conf = min(88, 65 + abs(score) * 3); direction = "SELL"
+        conf = min(88, 75 + abs(score) * 2); direction = "SELL"
     else:
         return None
 
@@ -434,8 +412,75 @@ def build_signal(price, change, high, low, vol, ta):
     }
 
 
+# ─────────────────────────── FLASK API ────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return "APEX Paper Bot running!", 200
+
+@app.route("/data")
+def get_data():
+    with state_lock:
+        total      = stats["total"]
+        trades_won = stats["trades_won"]
+        win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
+        net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+
+        open_pos = {}
+        for sym, pos in positions.items():
+            open_pos[sym] = {
+                "sym":        sym,
+                "direction":  pos["direction"],
+                "entry":      pos["entry"],
+                "execPrice":  pos["exec_price"],
+                "tp1":        pos["tp1"],
+                "tp2":        pos["tp2"],
+                "tp3":        pos["tp3"],
+                "tp4":        pos["tp4"],
+                "sl":         pos["sl"],
+                "liqPrice":   pos["liq_price"],
+                "tpHit":      pos["tp_hit"],
+                "breakeven":  pos.get("breakeven", False),
+                "margin":     pos["margin"],
+                "currentPnl": pos.get("currentPnl", 0),
+                "openTime":   pos.get("opened_at", 0),
+            }
+
+        payload = {
+            "balance":       paper_balance,
+            "startBalance":  PAPER_BALANCE,
+            "netPnl":        net_pnl,
+            "winRate":       win_rate,
+            "totalTrades":   total,
+            "tradesWon":     trades_won,
+            "tpHits":        stats["tp_hit"],
+            "slHits":        stats["sl_hit"],
+            "profitUsdt":    stats["profit_usdt"],
+            "lossUsdt":      stats["loss_usdt"],
+            "openPositions": open_pos,
+            "closedTrades":  stats["trades_list"][-50:],
+            "pnlHistory":    stats["pnl_history"],
+            "leverage":      LEVERAGE,
+            "tradeSize":     TRADE_SIZE,
+            "timestamp":     utc_now_str(),
+        }
+
+    response = jsonify(payload)
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    return response
+
+
+def start_flask():
+    # FIX: suppress Flask/werkzeug development server warning
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
 # ─────────────────────────── TELEGRAM ─────────────────────────
-def tg_send(msg, markup=None):
+def tg_send(msg):
     if not TG_TOKEN or not TG_CHAT:
         print("TG:", msg[:80])
         return None
@@ -445,8 +490,6 @@ def tg_send(msg, markup=None):
         "parse_mode":               "HTML",
         "disable_web_page_preview": True,
     }
-    if markup:
-        data["reply_markup"] = json.dumps(markup, separators=(",", ":"))
     try:
         r = session.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -507,18 +550,19 @@ def make_signal_msg(coin, sig, price, change):
     arrow     = "🟢" if action == "BUY" else "🔴"
     side_word = "LONG" if action == "BUY" else "SHORT"
 
-    rsi_str = f"{rsi:.1f}" if rsi else "N/A"
+    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
     ema_str = ("↑ Uptrend" if ema20 > ema50 else "↓ Downtrend") if (ema20 and ema50) else "N/A"
     vol_str = f"{vol_ratio:.1f}x avg" if vol_ratio else "N/A"
     lev_ret = [round(p * LEVERAGE, 1) for p in tp_pcts]
 
-    notional = float(TRADE_SIZE) * LEVERAGE
+    trade_size = calc_trade_size()
+    notional   = trade_size * LEVERAGE
 
     return (
         f"<b>📝 PAPER TRADE — APEX SIGNAL</b>\n"
         f"══════════════════════════════\n"
         f"{arrow} <b>{side_word} — {coin['symbol']}/USDT</b>\n\n"
-        f"⚙️ {LEVERAGE}x Leverage | ${float(TRADE_SIZE)} margin → ${notional:.0f} exposure\n\n"
+        f"⚙️ {LEVERAGE}x Leverage | ${trade_size:.0f} margin → ${notional:.0f} exposure\n\n"
         f"Entry:     {fmt_p(price)}\n"
         f"Target 1:  {fmt_p(sig['tp1'])}  (+{tp_pcts[0]}% | {lev_ret[0]}% levered)\n"
         f"Target 2:  {fmt_p(sig['tp2'])}  (+{tp_pcts[1]}% | {lev_ret[1]}% levered)\n"
@@ -537,46 +581,60 @@ def make_signal_msg(coin, sig, price, change):
     )
 
 
-def make_tp_msg(sym, direction, tp_num, entry, tp_price, elapsed, pnl_usdt, new_sl=None):
+def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pnl_usdt, new_sl=None):
     arrow     = "🟢" if direction == "BUY" else "🔴"
     side_word = "LONG" if direction == "BUY" else "SHORT"
     sl_note   = f"\n💡 SL → {fmt_p(new_sl)} (breakeven)" if tp_num == 1 and new_sl else \
                 f"\n💡 SL trailed to TP{tp_num - 1}" if tp_num > 1 and new_sl else ""
-    win_rate  = round(stats["tp_hit"] / stats["total"] * 100, 1) if stats["total"] > 0 else 0
-    net_pnl   = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-    net_sign  = "+" if net_pnl >= 0 else ""
+
+    with state_lock:
+        total      = stats["total"]
+        trades_won = stats["trades_won"]
+        win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
+        net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+        net_sign   = "+" if net_pnl >= 0 else ""
+        balance    = paper_balance
+
+    entry_note = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
 
     return (
         f"<b>✅ TP{tp_num} HIT — {sym} {side_word}</b> {arrow}\n\n"
         f"[PAPER TRADE]\n"
-        f"Entry: {fmt_p(entry)} → TP{tp_num}: {fmt_p(tp_price)}\n"
+        f"Entry: {fmt_p(entry)}{entry_note} → TP{tp_num}: {fmt_p(tp_price)}\n"
         f"Time: {elapsed_str(elapsed)}\n"
         f"Est. +${pnl_usdt:.2f} USDT (25% of position){sl_note}\n\n"
         f"📊 Session stats:\n"
-        f"Win rate: {stats['tp_hit']}/{stats['total']} = {win_rate}%\n"
+        f"Win rate: {trades_won}/{total} trades won = {win_rate}%\n"
         f"Net P&L: {net_sign}${abs(net_pnl):.2f} USDT\n"
-        f"Balance: ${paper_balance:.2f} USDT"
+        f"Balance: ${balance:.2f} USDT"
     )
 
 
-def make_sl_msg(sym, direction, entry, sl_price, elapsed, pnl_usdt, breakeven=False):
+def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, breakeven=False):
     side_word = "LONG" if direction == "BUY" else "SHORT"
     be_str    = " (at breakeven — no loss!)" if breakeven else ""
     sign      = "+" if breakeven else "-"
-    win_rate  = round(stats["tp_hit"] / stats["total"] * 100, 1) if stats["total"] > 0 else 0
-    net_pnl   = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-    net_sign  = "+" if net_pnl >= 0 else ""
+
+    with state_lock:
+        total      = stats["total"]
+        trades_won = stats["trades_won"]
+        win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
+        net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+        net_sign   = "+" if net_pnl >= 0 else ""
+        balance    = paper_balance
+
+    entry_note = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
 
     return (
         f"<b>{'✅' if breakeven else '❌'} SL HIT{be_str} — {sym} {side_word}</b>\n\n"
         f"[PAPER TRADE]\n"
-        f"Entry: {fmt_p(entry)} → SL: {fmt_p(sl_price)}\n"
+        f"Entry: {fmt_p(entry)}{entry_note} → SL: {fmt_p(sl_price)}\n"
         f"Time: {elapsed_str(elapsed)}\n"
         f"Est. {sign}${pnl_usdt:.2f} USDT\n\n"
         f"📊 Session stats:\n"
-        f"Win rate: {stats['tp_hit']}/{stats['total']} = {win_rate}%\n"
+        f"Win rate: {trades_won}/{total} trades won = {win_rate}%\n"
         f"Net P&L: {net_sign}${abs(net_pnl):.2f} USDT\n"
-        f"Balance: ${paper_balance:.2f} USDT"
+        f"Balance: ${balance:.2f} USDT"
     )
 
 
@@ -584,67 +642,99 @@ def make_sl_msg(sym, direction, entry, sl_price, elapsed, pnl_usdt, breakeven=Fa
 def paper_execute(coin, sig, price):
     """Simulate opening a leveraged position instantly."""
     global paper_balance
-    sym       = coin["symbol"]
-    direction = sig["signal"]
-    notional  = float(TRADE_SIZE) * LEVERAGE
-    qty       = round(notional / price, 6)
+    sym        = coin["symbol"]
+    direction  = sig["signal"]
+    trade_size = calc_trade_size()
+    notional   = trade_size * LEVERAGE
 
-    if paper_balance < float(TRADE_SIZE):
+    if direction == "BUY":
+        exec_price = round(price * (1 + SLIPPAGE_PCT), 8)
+    else:
+        exec_price = round(price * (1 - SLIPPAGE_PCT), 8)
+
+    qty = round(notional / exec_price, 6)
+
+    if direction == "BUY":
+        liq_price = round(exec_price * (1 - 0.9 / LEVERAGE), 8)
+    else:
+        liq_price = round(exec_price * (1 + 0.9 / LEVERAGE), 8)
+
+    # FIX: state mutations under lock, TG notification built then sent OUTSIDE lock
+    with state_lock:
+        if paper_balance < trade_size:
+            bal_snap = paper_balance
+        else:
+            bal_snap = None
+            paper_balance -= trade_size
+            stats["pnl_history"].append(round(paper_balance, 2))
+            positions[sym] = {
+                "direction":               direction,
+                "entry":                   price,
+                "exec_price":              exec_price,
+                "qty":                     qty,
+                "margin":                  trade_size,
+                "sl":                      sig["sl"],
+                "liq_price":               liq_price,
+                "tp1":                     sig["tp1"],
+                "tp2":                     sig["tp2"],
+                "tp3":                     sig["tp3"],
+                "tp4":                     sig["tp4"],
+                "tp_pcts":                 sig["tp_pcts"],
+                "tp_hit":                  0,
+                "first_tp_counted":        False,
+                "breakeven":               False,
+                "opened_at":               time.time(),
+                "funding_periods_charged": 0,
+                "currentPnl":              0.0,
+            }
+            bal_after  = paper_balance
+            open_count = len(positions)
+
+    # Send TG outside lock — no HTTP while holding state_lock
+    if bal_snap is not None:
         tg_send(
             f"<b>⚠️ Paper balance too low — {sym}</b>\n\n"
-            f"Balance: ${paper_balance:.2f} USDT\n"
-            f"Required margin: ${float(TRADE_SIZE)} USDT\n\n"
-            f"Skipping trade."
+            f"Balance: ${bal_snap:.2f} USDT\n"
+            f"Required margin: ${trade_size:.0f} USDT\n\nSkipping trade."
         )
         return False
 
-    paper_balance -= float(TRADE_SIZE)  # Lock margin
-    stats["pnl_history"].append(round(paper_balance, 2))
-
-    positions[sym] = {
-        "direction":  direction,
-        "entry":      price,
-        "qty":        qty,
-        "margin":     float(TRADE_SIZE),
-        "sl":         sig["sl"],
-        "tp1":        sig["tp1"],
-        "tp2":        sig["tp2"],
-        "tp3":        sig["tp3"],
-        "tp4":        sig["tp4"],
-        "tp_pcts":    sig["tp_pcts"],
-        "tp_hit":     0,
-        "breakeven":  False,
-        "opened_at":  time.time(),
-    }
-
     side_word = "LONG" if direction == "BUY" else "SHORT"
     lev_ret   = [round(p * LEVERAGE, 1) for p in sig["tp_pcts"]]
+    slip_note = f"\n⚡ Exec: {fmt_p(exec_price)} (slippage applied)" \
+                if abs(exec_price - price) / price > 0.0001 else ""
 
     tg_send(
         f"<b>📝 PAPER TRADE ENTERED — {sym}</b>\n\n"
         f"{'🟢' if direction == 'BUY' else '🔴'} <b>{side_word} {sym}/USDT</b>\n\n"
-        f"Entry:     {fmt_p(price)}\n"
-        f"Margin:    ${float(TRADE_SIZE)} USDT\n"
+        f"Signal price: {fmt_p(price)}{slip_note}\n"
+        f"Margin:    ${trade_size:.0f} USDT\n"
         f"Exposure:  ${notional:.0f} USDT ({LEVERAGE}x)\n"
         f"Qty:       {qty}\n\n"
         f"TP1: {fmt_p(sig['tp1'])}  ({lev_ret[0]}% levered)\n"
         f"TP2: {fmt_p(sig['tp2'])}  ({lev_ret[1]}% levered)\n"
         f"TP3: {fmt_p(sig['tp3'])}  ({lev_ret[2]}% levered)\n"
         f"TP4: {fmt_p(sig['tp4'])}  ({lev_ret[3]}% levered)\n"
-        f"SL:  {fmt_p(sig['sl'])}\n\n"
-        f"💰 Paper balance: ${paper_balance:.2f} USDT\n"
-        f"Open trades: {len(positions)}\n\n"
+        f"SL:  {fmt_p(sig['sl'])}\n"
+        f"Liq: {fmt_p(liq_price)}\n\n"
+        f"💰 Paper balance: ${bal_after:.2f} USDT\n"
+        f"Open trades: {open_count}\n\n"
         f"🤖 Bot monitors: auto TP/SL + trailing stop"
     )
-    print(f"  📝 Paper trade: {direction} {sym} @ {price} qty={qty}")
+    print(f"  📝 Paper trade: {direction} {sym} @ {exec_price} (signal {price}) qty={qty}")
     return True
 
 
 # ──────────────────────── POSITION MONITOR ────────────────────
 def monitor_positions(prices):
-    """Check all paper positions against live prices."""
+    """
+    FIX: Collect all notifications in a list, send AFTER releasing lock.
+    This prevents holding state_lock during slow HTTP calls to Telegram,
+    keeping the Flask /data endpoint responsive.
+    """
     global paper_balance
-    to_remove = []
+    to_remove     = []
+    notifications = []   # (msg_str,) — built inside lock, sent outside
 
     for sym, pos in list(positions.items()):
         coin_data = next((c for c in COINS if c["symbol"] == sym), None)
@@ -652,125 +742,189 @@ def monitor_positions(prices):
             to_remove.append(sym)
             continue
 
-        d     = (prices.get(coin_data["id"]) or {})
+        d     = prices.get(coin_data["id"]) or {}
         price = d.get("usd")
         if not price:
             continue
 
-        direction = pos["direction"]
-        entry     = pos["entry"]
-        sl        = pos["sl"]
-        tp_hit    = pos["tp_hit"]
-        elapsed   = time.time() - pos["opened_at"]
-        tp_levels = [pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"]]
+        direction  = pos["direction"]
+        entry      = pos["entry"]
+        exec_price = pos["exec_price"]
+        sl         = pos["sl"]
+        liq_price  = pos["liq_price"]
+        tp_hit     = pos["tp_hit"]
+        elapsed    = time.time() - pos["opened_at"]
+        tp_levels  = [pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"]]
+        trade_size = pos["margin"]
 
-        # ── SL check ──
-        sl_hit = (direction == "BUY" and price <= sl) or \
-                 (direction == "SELL" and price >= sl)
+        with state_lock:
+            # ── Funding deduction every 8 hours ──
+            funding_due = int(elapsed / 28800)
+            new_periods = funding_due - pos.get("funding_periods_charged", 0)
+            if new_periods > 0:
+                rem_pct      = 1.0 - (tp_hit * 0.25)
+                funding_cost = trade_size * LEVERAGE * FUNDING_RATE * new_periods * rem_pct
+                paper_balance -= funding_cost
+                pos["funding_periods_charged"] = funding_due
+                stats["pnl_history"].append(round(paper_balance, 2))
+                print(f"  💸 Funding: {sym} -${funding_cost:.4f} ({new_periods} period(s))")
 
-        if sl_hit:
-            # Calculate loss on remaining position (after any partial closes)
-            remaining_pct = 1.0 - (tp_hit * 0.25)
-            price_move    = abs(sl - entry) / entry * 100
-            is_profit     = (direction == "BUY" and sl >= entry) or \
-                            (direction == "SELL" and sl <= entry)
-            pnl_usdt      = round(float(TRADE_SIZE) * LEVERAGE * price_move / 100 * remaining_pct, 2)
-            remaining_margin = float(TRADE_SIZE) * remaining_pct
+            # ── Liquidation check ──
+            liq_hit = (direction == "BUY"  and price <= liq_price) or \
+                      (direction == "SELL" and price >= liq_price)
 
-            if is_profit:
-                stats["profit_usdt"] += pnl_usdt
-                paper_balance += remaining_margin + pnl_usdt
-            else:
-                stats["loss_usdt"] += pnl_usdt
-                paper_balance += max(0, remaining_margin - pnl_usdt)
-            stats["pnl_history"].append(round(paper_balance, 2))
-
-            stats["total"] += 1
-            stats["sl_hit"] += 1
-            stats["trades_list"].append({
-                "sym": sym, "direction": direction, "result": "SL",
-                "pnl": pnl_usdt if is_profit else -pnl_usdt,
-                "time": utc_now_str(),
-            })
-            tg_send(make_sl_msg(sym, direction, entry, sl, elapsed, pnl_usdt, pos.get("breakeven")))
-            to_remove.append(sym)
-            continue
-
-        # ── TP check ──
-        if tp_hit >= 4:
-            to_remove.append(sym)
-            continue
-
-        next_tp = tp_levels[tp_hit]
-        tp_reached = (direction == "BUY" and price >= next_tp) or \
-                     (direction == "SELL" and price <= next_tp)
-
-        if tp_reached:
-            tp_num    = tp_hit + 1
-            pnl_pct   = abs(next_tp - entry) / entry * 100
-            pnl_usdt  = round(float(TRADE_SIZE) * LEVERAGE * pnl_pct / 100 * 0.25, 2)
-            quarter_margin = float(TRADE_SIZE) * 0.25
-
-            stats["tp_hit"]      += 1
-            stats["profit_usdt"] += pnl_usdt
-            paper_balance        += quarter_margin + pnl_usdt
-            stats["pnl_history"].append(round(paper_balance, 2))
-            pos["currentPnl"] = pos.get("currentPnl", 0) + pnl_usdt
-
-            # Move/trail SL
-            new_sl = None
-            if tp_num == 1 and not pos.get("breakeven"):
-                new_sl         = entry  # Breakeven
-                pos["sl"]      = new_sl
-                pos["breakeven"] = True
-            elif tp_num == 2:
-                new_sl    = tp_levels[0]  # Trail to TP1
-                pos["sl"] = new_sl
-            elif tp_num == 3:
-                new_sl    = tp_levels[1]  # Trail to TP2
-                pos["sl"] = new_sl
-
-            pos["tp_hit"] = tp_num
-
-            if tp_num == 4:
-                # All TPs hit — full win
-                stats["total"] += 1
+            if liq_hit:
+                rem_pct          = 1.0 - (tp_hit * 0.25)
+                remaining_margin = trade_size * rem_pct
+                stats["loss_usdt"] += remaining_margin
+                stats["total"]     += 1
+                stats["sl_hit"]    += 1
+                stats["pnl_history"].append(round(paper_balance, 2))
                 stats["trades_list"].append({
-                    "sym": sym, "direction": direction, "result": "ALL_TP",
-                    "pnl": round(stats["profit_usdt"], 2), "time": utc_now_str(),
+                    "sym": sym, "direction": direction,
+                    "result": "LIQUIDATED", "pnl": -remaining_margin,
+                    "time": utc_now_str(),
                 })
-                win_rate = round(stats["tp_hit"] / stats["total"] * 100, 1)
-                net_pnl  = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-                tg_send(
-                    f"<b>🎯 ALL 4 TPs HIT — {sym}!</b>\n\n"
+                notifications.append(
+                    f"<b>💀 LIQUIDATED — {sym}</b>\n\n"
                     f"[PAPER TRADE]\n"
-                    f"Full trade complete — perfect signal!\n\n"
-                    f"📊 Session stats:\n"
-                    f"Win rate: {stats['tp_hit']}/{stats['total']} = {win_rate}%\n"
-                    f"Net P&L: +${net_pnl:.2f} USDT\n"
+                    f"Price hit liquidation at {fmt_p(liq_price)}\n"
+                    f"Margin lost: ${remaining_margin:.2f} USDT\n\n"
                     f"Balance: ${paper_balance:.2f} USDT"
                 )
                 to_remove.append(sym)
-            else:
-                tg_send(make_tp_msg(sym, direction, tp_num, entry, next_tp, elapsed, pnl_usdt, new_sl))
-                print(f"  TP{tp_num} hit: {sym} @ ${price}")
+                continue
 
-    for sym in to_remove:
-        positions.pop(sym, None)
+            # ── SL check ──
+            sl_hit = (direction == "BUY"  and price <= sl) or \
+                     (direction == "SELL" and price >= sl)
+
+            if sl_hit:
+                rem_pct          = 1.0 - (tp_hit * 0.25)
+                price_move       = abs(sl - exec_price) / exec_price * 100
+                is_profit        = (direction == "BUY"  and sl >= exec_price) or \
+                                   (direction == "SELL" and sl <= exec_price)
+                pnl_usdt         = round(trade_size * LEVERAGE * price_move / 100 * rem_pct, 2)
+                remaining_margin = trade_size * rem_pct
+
+                if is_profit:
+                    stats["profit_usdt"] += pnl_usdt
+                    paper_balance        += remaining_margin + pnl_usdt
+                else:
+                    stats["loss_usdt"] += pnl_usdt
+                    paper_balance      += max(0, remaining_margin - pnl_usdt)
+
+                stats["total"]  += 1
+                stats["sl_hit"] += 1
+                stats["pnl_history"].append(round(paper_balance, 2))
+                stats["trades_list"].append({
+                    "sym": sym, "direction": direction, "result": "SL",
+                    "pnl": pnl_usdt if is_profit else -pnl_usdt,
+                    "time": utc_now_str(),
+                })
+                # Build message inside lock (reads stats), send outside
+                notifications.append(
+                    make_sl_msg(sym, direction, entry, exec_price, sl,
+                                elapsed, pnl_usdt, pos.get("breakeven"))
+                )
+                to_remove.append(sym)
+                continue
+
+            # ── TP check ──
+            if tp_hit >= 4:
+                to_remove.append(sym)
+                continue
+
+            next_tp    = tp_levels[tp_hit]
+            tp_reached = (direction == "BUY"  and price >= next_tp) or \
+                         (direction == "SELL" and price <= next_tp)
+
+            if tp_reached:
+                tp_num         = tp_hit + 1
+                pnl_pct        = abs(next_tp - exec_price) / exec_price * 100
+                pnl_usdt       = round(trade_size * LEVERAGE * pnl_pct / 100 * 0.25, 2)
+                quarter_margin = trade_size * 0.25
+
+                stats["tp_hit"]      += 1
+                stats["profit_usdt"] += pnl_usdt
+                paper_balance        += quarter_margin + pnl_usdt
+                stats["pnl_history"].append(round(paper_balance, 2))
+                pos["currentPnl"]     = pos.get("currentPnl", 0) + pnl_usdt
+
+                # FIX: increment trades_won on first TP hit (once per trade)
+                if not pos["first_tp_counted"]:
+                    stats["trades_won"]    += 1
+                    pos["first_tp_counted"] = True
+
+                # Trail SL
+                new_sl = None
+                if tp_num == 1 and not pos.get("breakeven"):
+                    new_sl           = exec_price
+                    pos["sl"]        = new_sl
+                    pos["breakeven"] = True
+                elif tp_num == 2:
+                    new_sl    = tp_levels[0]
+                    pos["sl"] = new_sl
+                elif tp_num == 3:
+                    new_sl    = tp_levels[1]
+                    pos["sl"] = new_sl
+
+                pos["tp_hit"] = tp_num
+
+                if tp_num == 4:
+                    stats["total"] += 1
+                    stats["trades_list"].append({
+                        "sym": sym, "direction": direction, "result": "ALL_TP",
+                        "pnl": round(pos["currentPnl"], 2), "time": utc_now_str(),
+                    })
+                    total      = stats["total"]
+                    trades_won = stats["trades_won"]
+                    win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
+                    net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+                    notifications.append(
+                        f"<b>🎯 ALL 4 TPs HIT — {sym}!</b>\n\n"
+                        f"[PAPER TRADE]\n"
+                        f"Full trade complete — perfect signal!\n\n"
+                        f"📊 Session stats:\n"
+                        f"Win rate: {trades_won}/{total} trades won = {win_rate}%\n"
+                        f"Net P&L: +${net_pnl:.2f} USDT\n"
+                        f"Balance: ${paper_balance:.2f} USDT"
+                    )
+                    to_remove.append(sym)
+                else:
+                    notifications.append(
+                        make_tp_msg(sym, direction, tp_num, entry, exec_price,
+                                    next_tp, elapsed, pnl_usdt, new_sl)
+                    )
+                    print(f"  TP{tp_num} hit: {sym} @ ${price}")
+
+        # End of with state_lock
+
+    # Cleanup positions
+    with state_lock:
+        for sym in to_remove:
+            positions.pop(sym, None)
+
+    # FIX: send all notifications OUTSIDE the lock — no HTTP while holding state_lock
+    for msg in notifications:
+        tg_send(msg)
 
 
 # ─────────────────────────── MAIN ─────────────────────────────
 def run():
-    global paper_balance
+    # FIX: declare both globals so pre_warned pruning updates the real global dict
+    global paper_balance, pre_warned
+
     print("=" * 55)
     print("  APEX Bybit Bot — PAPER TRADING MODE")
     print("=" * 55)
+    sizing_note = f"dynamic ({RISK_PCT*100:.0f}% of balance)" if USE_DYNAMIC_SIZING else "fixed"
     print(f"Starting balance: ${PAPER_BALANCE} USDT (simulated)")
-    print(f"Trade size: ${TRADE_SIZE} × {LEVERAGE}x = ${float(TRADE_SIZE) * LEVERAGE} exposure")
+    print(f"Trade size: {sizing_note} × {LEVERAGE}x leverage")
+    print(f"Slippage: {SLIPPAGE_PCT*100:.2f}% | Funding: {FUNDING_RATE*100:.3f}%/8h")
     print(f"Telegram: {'OK' if TG_TOKEN else 'MISSING'}")
     print(f"Blocked: {BLOCKED_COINS}")
 
-    # Start Flask API in background thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     print(f"Dashboard API running on port {os.environ.get('PORT', 8080)}")
@@ -779,7 +933,7 @@ def run():
         "<b>📝 APEX Paper Trading Bot — Online!</b>\n\n"
         f"Exchange: <b>Bybit Futures (SIMULATED)</b>\n"
         f"Leverage: <b>{LEVERAGE}x</b>\n"
-        f"Trade size: <b>${TRADE_SIZE} USDT</b> → ${float(TRADE_SIZE) * LEVERAGE:.0f} exposure\n"
+        f"Sizing: <b>{sizing_note}</b>\n"
         f"Starting balance: <b>${PAPER_BALANCE} USDT</b>\n"
         f"Coins monitored: <b>{len(COINS)}</b>\n"
         f"Min confidence: <b>{MIN_CONF}%</b>\n\n"
@@ -789,7 +943,10 @@ def run():
         f"• Volume spike detection\n"
         f"• 4-target GG Shot style signals\n"
         f"• BUY (Long) + SELL (Short) signals\n\n"
-        f"<b>Simulation:</b> Fires instantly, tracks real P&L\n"
+        f"<b>Simulation:</b>\n"
+        f"• Entry slippage: {SLIPPAGE_PCT*100:.2f}%\n"
+        f"• Funding rate: {FUNDING_RATE*100:.3f}%/8h\n"
+        f"• Liquidation price tracked\n\n"
         f"Blocked: {', '.join(BLOCKED_COINS) or 'None'}\n\n"
         f"<i>No real money at risk — pure data collection!</i>"
     )
@@ -803,34 +960,60 @@ def run():
         try:
             offset = check_btns(offset)
 
-            # Refresh prices every 10s
             if time.time() - last_price_t >= 10:
                 prices = get_prices()
                 last_price_t = time.time()
 
-            if prices and positions:
-                monitor_positions(prices)
+            if prices:
+                with state_lock:
+                    open_syms = list(positions.keys())
+                if open_syms:
+                    monitor_positions(prices)
 
             # ── SCAN ──
             if time.time() - last_scan_at >= SCAN_EVERY_SECONDS:
                 last_scan_at = time.time()
+
+                with state_lock:
+                    open_count = len(positions)
+                    balance    = paper_balance
+
                 print(
                     f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
                     f"Scanning {len(COINS)} coins... "
-                    f"(open: {len(positions)}, balance: ${paper_balance:.2f})"
+                    f"(open: {open_count}, balance: ${balance:.2f})"
                 )
+
+                # FIX: prune stale pre-warns properly using global declaration above
+                now = time.time()
+                pre_warned = {k: v for k, v in pre_warned.items() if now - v < PRE_WARN_TTL}
 
                 scan_prices = get_prices()
                 if scan_prices:
                     prices = scan_prices
 
+                    ta_candidates = []
                     for coin in COINS:
                         sym = coin["symbol"]
-
                         if sym in BLOCKED_COINS:
                             continue
-                        if sym in positions:
+                        with state_lock:
+                            if sym in positions:
+                                continue
+                        d      = scan_prices.get(coin["id"]) or {}
+                        change = d.get("usd_24h_change", 0) or 0
+                        if abs(change) >= 3:
+                            ta_candidates.append(sym)
+
+                    ta_map = fetch_ta_parallel(ta_candidates) if ta_candidates else {}
+
+                    for coin in COINS:
+                        sym = coin["symbol"]
+                        if sym in BLOCKED_COINS:
                             continue
+                        with state_lock:
+                            if sym in positions:
+                                continue
 
                         d      = scan_prices.get(coin["id"]) or {}
                         price  = d.get("usd")
@@ -844,13 +1027,12 @@ def run():
 
                         print(f"  {sym}: ${price} {round(change, 2)}%", end="")
 
-                        ta = None
-                        if abs(change) >= 3:
-                            ta = get_ta(sym)
-                            if ta:
-                                trend = "↑" if ta.get("ema20") and ta.get("ema50") and ta["ema20"] > ta["ema50"] else "↓"
-                                print(f" | RSI={ta.get('rsi','?')} EMA={trend} Vol={ta.get('vol_ratio', 1.0):.1f}x", end="")
-                            time.sleep(0.1)
+                        ta = ta_map.get(sym)
+                        if ta:
+                            trend = "↑" if ta.get("ema20") and ta.get("ema50") and \
+                                          ta["ema20"] > ta["ema50"] else "↓"
+                            print(f" | RSI={ta.get('rsi','?')} EMA={trend} "
+                                  f"Vol={ta.get('vol_ratio', 1.0):.1f}x", end="")
 
                         sig = build_signal(price, change, high, low, vol, ta)
                         print()
@@ -862,24 +1044,21 @@ def run():
                                 print(f"  ⚠️ Pre-warn: {sym}")
                             continue
 
-                        # Deduplicate
                         prev = last_signal.get(sym)
-                        if prev and prev["signal"] == sig["signal"] and abs(prev.get("entry", 0) - price) / price < 0.005:
+                        if prev and prev["signal"] == sig["signal"] and \
+                                abs(prev.get("entry", 0) - price) / price < 0.005:
                             continue
 
-                        # Max trades check
-                        if len(positions) >= MAX_OPEN_TRADES:
-                            print(f"  Max trades reached, skipping {sym}")
-                            continue
+                        with state_lock:
+                            if len(positions) >= MAX_OPEN_TRADES:
+                                print(f"  Max trades reached, skipping {sym}")
+                                continue
+                            pre_warned.pop(sym, None)
 
-                        pre_warned.pop(sym, None)
-                        sig["entry"] = price
+                        sig["entry"]     = price
                         last_signal[sym] = sig
 
-                        # Send signal message
                         tg_send(make_signal_msg(coin, sig, price, change))
-
-                        # Enter paper trade immediately
                         paper_execute(coin, sig, price)
                         print(f"  🚀 Paper signal: {sym} {sig['signal']} {sig['conf']}%")
 
@@ -887,8 +1066,11 @@ def run():
 
         except KeyboardInterrupt:
             print("\nBot stopped.")
-            net = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-            print(f"Final: {stats['tp_hit']}/{stats['total']} wins | Net P&L: ${net}")
+            with state_lock:
+                net   = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+                won   = stats["trades_won"]
+                total = stats["total"]
+            print(f"Final: {won}/{total} trades won | Net P&L: ${net}")
             break
         except Exception as e:
             print(f"Main loop error: {e}")
