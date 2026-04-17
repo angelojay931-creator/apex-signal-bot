@@ -20,12 +20,69 @@ import json
 import time
 import hmac
 import hashlib
+import threading
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 
 import requests
+from flask import Flask, jsonify
 
-# ─────────────────────────── CONFIG ───────────────────────────
+# ─────────────────────────── FLASK API ────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return "APEX Paper Bot running!", 200
+
+@app.route("/data")
+def get_data():
+    """Dashboard reads from this endpoint."""
+    net_pnl  = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+    win_rate = round(stats["tp_hit"] / stats["total"] * 100, 1) if stats["total"] > 0 else 0
+
+    open_pos = {}
+    for sym, pos in positions.items():
+        open_pos[sym] = {
+            "sym":       sym,
+            "direction": pos["direction"],
+            "entry":     pos["entry"],
+            "tp1":       pos["tp1"],
+            "tp2":       pos["tp2"],
+            "tp3":       pos["tp3"],
+            "tp4":       pos["tp4"],
+            "sl":        pos["sl"],
+            "tpHit":     pos["tp_hit"],
+            "breakeven": pos.get("breakeven", False),
+            "margin":    pos.get("margin", float(TRADE_SIZE)),
+            "currentPnl": pos.get("currentPnl", 0),
+            "openTime":  pos.get("opened_at", 0),
+        }
+
+    response = jsonify({
+        "balance":       paper_balance,
+        "startBalance":  PAPER_BALANCE,
+        "netPnl":        net_pnl,
+        "winRate":       win_rate,
+        "totalTrades":   stats["total"],
+        "tpHits":        stats["tp_hit"],
+        "slHits":        stats["sl_hit"],
+        "profitUsdt":    stats["profit_usdt"],
+        "lossUsdt":      stats["loss_usdt"],
+        "openPositions": open_pos,
+        "closedTrades":  stats.get("trades_list", [])[-50:],
+        "pnlHistory":    stats.get("pnl_history", [PAPER_BALANCE]),
+        "leverage":      LEVERAGE,
+        "tradeSize":     float(TRADE_SIZE),
+        "timestamp":     utc_now_str(),
+    })
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    return response
+
+def start_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
 PAPER_TRADING = True           # ← Flip to False for real money
 PAPER_BALANCE = 200.0          # Simulated starting USDT balance
 
@@ -57,7 +114,8 @@ stats = {
     "sl_hit":       0,
     "profit_usdt":  0.0,
     "loss_usdt":    0.0,
-    "trades_list":  [],   # list of closed trades for history
+    "trades_list":  [],
+    "pnl_history":  [],
 }
 
 # ─────────────────────────── COINS ────────────────────────────
@@ -541,6 +599,7 @@ def paper_execute(coin, sig, price):
         return False
 
     paper_balance -= float(TRADE_SIZE)  # Lock margin
+    stats["pnl_history"].append(round(paper_balance, 2))
 
     positions[sym] = {
         "direction":  direction,
@@ -623,7 +682,8 @@ def monitor_positions(prices):
                 paper_balance += remaining_margin + pnl_usdt
             else:
                 stats["loss_usdt"] += pnl_usdt
-                paper_balance += max(0, remaining_margin - pnl_usdt)  # Return remaining margin minus loss
+                paper_balance += max(0, remaining_margin - pnl_usdt)
+            stats["pnl_history"].append(round(paper_balance, 2))
 
             stats["total"] += 1
             stats["sl_hit"] += 1
@@ -653,7 +713,9 @@ def monitor_positions(prices):
 
             stats["tp_hit"]      += 1
             stats["profit_usdt"] += pnl_usdt
-            paper_balance        += quarter_margin + pnl_usdt   # Return margin + profit for this quarter
+            paper_balance        += quarter_margin + pnl_usdt
+            stats["pnl_history"].append(round(paper_balance, 2))
+            pos["currentPnl"] = pos.get("currentPnl", 0) + pnl_usdt
 
             # Move/trail SL
             new_sl = None
@@ -707,6 +769,11 @@ def run():
     print(f"Trade size: ${TRADE_SIZE} × {LEVERAGE}x = ${float(TRADE_SIZE) * LEVERAGE} exposure")
     print(f"Telegram: {'OK' if TG_TOKEN else 'MISSING'}")
     print(f"Blocked: {BLOCKED_COINS}")
+
+    # Start Flask API in background thread
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
+    print(f"Dashboard API running on port {os.environ.get('PORT', 8080)}")
 
     tg_send(
         "<b>📝 APEX Paper Trading Bot — Online!</b>\n\n"
