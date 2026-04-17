@@ -26,24 +26,24 @@ from flask import Flask, jsonify
 
 # ─────────────────────────── CONFIG ───────────────────────────
 PAPER_TRADING  = True
-PAPER_BALANCE  = 200.0
+PAPER_BALANCE  = 1000.0        # Simulated balance: $1000 USDT
 
 BYBIT_KEY    = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_SECRET = os.environ.get("BYBIT_SECRET", "").strip()
 TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-TRADE_SIZE         = 25.0
-USE_DYNAMIC_SIZING = True
-RISK_PCT           = 0.10
-MIN_TRADE_SIZE     = 10.0
-MAX_TRADE_SIZE     = 50.0
+TRADE_SIZE         = 100.0     # Fixed $100 USDT margin per trade
+USE_DYNAMIC_SIZING = False     # Fixed sizing — $100 always
+RISK_PCT           = 0.10      # Unused when dynamic sizing is off
+MIN_TRADE_SIZE     = 100.0
+MAX_TRADE_SIZE     = 100.0
 
-LEVERAGE           = 3
+LEVERAGE           = 3         # 3x → $300 exposure per trade
 MIN_CONF           = 85
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
-MAX_OPEN_TRADES    = 5
+MAX_OPEN_TRADES    = 8         # 8 × $100 = $800 max deployed ($200 kept in reserve)
 
 SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
@@ -73,70 +73,216 @@ stats = {
 last_signal = {}
 
 # ─────────────────────────── COINS ────────────────────────────
+# Top 200 coins by market cap — stablecoins and wrapped tokens excluded
 COINS = [
-    {"id": "bitcoin",                   "symbol": "BTC",    "bybit": "BTCUSDT"},
-    {"id": "ethereum",                  "symbol": "ETH",    "bybit": "ETHUSDT"},
-    {"id": "ripple",                    "symbol": "XRP",    "bybit": "XRPUSDT"},
-    {"id": "binancecoin",               "symbol": "BNB",    "bybit": "BNBUSDT"},
-    {"id": "solana",                    "symbol": "SOL",    "bybit": "SOLUSDT"},
-    {"id": "dogecoin",                  "symbol": "DOGE",   "bybit": "DOGEUSDT"},
-    {"id": "cardano",                   "symbol": "ADA",    "bybit": "ADAUSDT"},
-    {"id": "tron",                      "symbol": "TRX",    "bybit": "TRXUSDT"},
-    {"id": "avalanche-2",               "symbol": "AVAX",   "bybit": "AVAXUSDT"},
-    {"id": "sui",                       "symbol": "SUI",    "bybit": "SUIUSDT"},
-    {"id": "chainlink",                 "symbol": "LINK",   "bybit": "LINKUSDT"},
-    {"id": "stellar",                   "symbol": "XLM",    "bybit": "XLMUSDT"},
-    {"id": "litecoin",                  "symbol": "LTC",    "bybit": "LTCUSDT"},
-    {"id": "polkadot",                  "symbol": "DOT",    "bybit": "DOTUSDT"},
-    {"id": "uniswap",                   "symbol": "UNI",    "bybit": "UNIUSDT"},
-    {"id": "near",                      "symbol": "NEAR",   "bybit": "NEARUSDT"},
-    {"id": "aptos",                     "symbol": "APT",    "bybit": "APTUSDT"},
-    {"id": "internet-computer",         "symbol": "ICP",    "bybit": "ICPUSDT"},
-    {"id": "ethereum-classic",          "symbol": "ETC",    "bybit": "ETCUSDT"},
-    {"id": "filecoin",                  "symbol": "FIL",    "bybit": "FILUSDT"},
-    {"id": "injective-protocol",        "symbol": "INJ",    "bybit": "INJUSDT"},
-    {"id": "optimism",                  "symbol": "OP",     "bybit": "OPUSDT"},
-    {"id": "arbitrum",                  "symbol": "ARB",    "bybit": "ARBUSDT"},
-    {"id": "pepe",                      "symbol": "PEPE",   "bybit": "PEPEUSDT"},
-    {"id": "shiba-inu",                 "symbol": "SHIB",   "bybit": "SHIBUSDT"},
-    {"id": "kaspa",                     "symbol": "KAS",    "bybit": "KASUSDT"},
-    {"id": "bonk",                      "symbol": "BONK",   "bybit": "BONKUSDT"},
-    {"id": "celestia",                  "symbol": "TIA",    "bybit": "TIAUSDT"},
-    {"id": "sei-network",               "symbol": "SEI",    "bybit": "SEIUSDT"},
-    {"id": "starknet",                  "symbol": "STRK",   "bybit": "STRKUSDT"},
-    {"id": "the-graph",                 "symbol": "GRT",    "bybit": "GRTUSDT"},
-    {"id": "render-token",              "symbol": "RENDER", "bybit": "RENDERUSDT"},
-    {"id": "immutable-x",               "symbol": "IMX",    "bybit": "IMXUSDT"},
-    {"id": "thorchain",                 "symbol": "RUNE",   "bybit": "RUNEUSDT"},
-    {"id": "mantle",                    "symbol": "MNT",    "bybit": "MNTUSDT"},
-    {"id": "ondo-finance",              "symbol": "ONDO",   "bybit": "ONDOUSDT"},
-    {"id": "raydium",                   "symbol": "RAY",    "bybit": "RAYUSDT"},
-    {"id": "aave",                      "symbol": "AAVE",   "bybit": "AAVEUSDT"},
-    {"id": "curve-dao-token",           "symbol": "CRV",    "bybit": "CRVUSDT"},
-    {"id": "lido-dao",                  "symbol": "LDO",    "bybit": "LDOUSDT"},
-    {"id": "enjincoin",                 "symbol": "ENJ",    "bybit": "ENJUSDT"},
-    {"id": "ankr",                      "symbol": "ANKR",   "bybit": "ANKRUSDT"},
-    {"id": "fetch-ai",                  "symbol": "FET",    "bybit": "FETUSDT"},
-    {"id": "matic-network",             "symbol": "POL",    "bybit": "POLUSDT"},
-    {"id": "bittensor",                 "symbol": "TAO",    "bybit": "TAOUSDT"},
-    {"id": "ronin",                     "symbol": "RON",    "bybit": "RONUSDT"},
-    {"id": "terra-luna-2",              "symbol": "LUNA",   "bybit": "LUNAUSDT"},
-    {"id": "kava",                      "symbol": "KAVA",   "bybit": "KAVAUSDT"},
-    {"id": "iota",                      "symbol": "IOTA",   "bybit": "IOTAUSDT"},
-    {"id": "neo",                       "symbol": "NEO",    "bybit": "NEOUSDT"},
-    {"id": "dash",                      "symbol": "DASH",   "bybit": "DASHUSDT"},
-    {"id": "zcash",                     "symbol": "ZEC",    "bybit": "ZECUSDT"},
-    {"id": "sushi",                     "symbol": "SUSHI",  "bybit": "SUSHIUSDT"},
-    {"id": "eos",                       "symbol": "EOS",    "bybit": "EOSUSDT"},
-    {"id": "ontology",                  "symbol": "ONT",    "bybit": "ONTUSDT"},
-    {"id": "waves",                     "symbol": "WAVES",  "bybit": "WAVESUSDT"},
-    {"id": "gmx",                       "symbol": "GMX",    "bybit": "GMXUSDT"},
-    {"id": "dydx-chain",                "symbol": "DYDX",   "bybit": "DYDXUSDT"},
-    {"id": "pendle",                    "symbol": "PENDLE", "bybit": "PENDLEUSDT"},
-    {"id": "worldcoin-wld",             "symbol": "WLD",    "bybit": "WLDUSDT"},
-    {"id": "jupiter-exchange-solana",   "symbol": "JUP",    "bybit": "JUPUSDT"},
-    {"id": "dogwifcoin",                "symbol": "WIF",    "bybit": "WIFUSDT"},
+    # ── TOP 10 ──
+    {"id": "bitcoin",                   "symbol": "BTC",     "bybit": "BTCUSDT"},
+    {"id": "ethereum",                  "symbol": "ETH",     "bybit": "ETHUSDT"},
+    {"id": "ripple",                    "symbol": "XRP",     "bybit": "XRPUSDT"},
+    {"id": "binancecoin",               "symbol": "BNB",     "bybit": "BNBUSDT"},
+    {"id": "solana",                    "symbol": "SOL",     "bybit": "SOLUSDT"},
+    {"id": "dogecoin",                  "symbol": "DOGE",    "bybit": "DOGEUSDT"},
+    {"id": "cardano",                   "symbol": "ADA",     "bybit": "ADAUSDT"},
+    {"id": "tron",                      "symbol": "TRX",     "bybit": "TRXUSDT"},
+    {"id": "avalanche-2",               "symbol": "AVAX",    "bybit": "AVAXUSDT"},
+    {"id": "sui",                       "symbol": "SUI",     "bybit": "SUIUSDT"},
+    # ── 11-30 ──
+    {"id": "chainlink",                 "symbol": "LINK",    "bybit": "LINKUSDT"},
+    {"id": "stellar",                   "symbol": "XLM",     "bybit": "XLMUSDT"},
+    {"id": "litecoin",                  "symbol": "LTC",     "bybit": "LTCUSDT"},
+    {"id": "polkadot",                  "symbol": "DOT",     "bybit": "DOTUSDT"},
+    {"id": "uniswap",                   "symbol": "UNI",     "bybit": "UNIUSDT"},
+    {"id": "near",                      "symbol": "NEAR",    "bybit": "NEARUSDT"},
+    {"id": "aptos",                     "symbol": "APT",     "bybit": "APTUSDT"},
+    {"id": "internet-computer",         "symbol": "ICP",     "bybit": "ICPUSDT"},
+    {"id": "ethereum-classic",          "symbol": "ETC",     "bybit": "ETCUSDT"},
+    {"id": "bittensor",                 "symbol": "TAO",     "bybit": "TAOUSDT"},
+    {"id": "hyperliquid",               "symbol": "HYPE",    "bybit": "HYPEUSDT"},
+    {"id": "pepe",                      "symbol": "PEPE",    "bybit": "PEPEUSDT"},
+    {"id": "aave",                      "symbol": "AAVE",    "bybit": "AAVEUSDT"},
+    {"id": "monero",                    "symbol": "XMR",     "bybit": "XMRUSDT"},
+    {"id": "filecoin",                  "symbol": "FIL",     "bybit": "FILUSDT"},
+    {"id": "injective-protocol",        "symbol": "INJ",     "bybit": "INJUSDT"},
+    {"id": "arbitrum",                  "symbol": "ARB",     "bybit": "ARBUSDT"},
+    {"id": "optimism",                  "symbol": "OP",      "bybit": "OPUSDT"},
+    {"id": "kaspa",                     "symbol": "KAS",     "bybit": "KASUSDT"},
+    {"id": "render-token",              "symbol": "RENDER",  "bybit": "RENDERUSDT"},
+    # ── 31-60 ──
+    {"id": "shiba-inu",                 "symbol": "SHIB",    "bybit": "SHIBUSDT"},
+    {"id": "bonk",                      "symbol": "BONK",    "bybit": "BONKUSDT"},
+    {"id": "celestia",                  "symbol": "TIA",     "bybit": "TIAUSDT"},
+    {"id": "sei-network",               "symbol": "SEI",     "bybit": "SEIUSDT"},
+    {"id": "starknet",                  "symbol": "STRK",    "bybit": "STRKUSDT"},
+    {"id": "the-graph",                 "symbol": "GRT",     "bybit": "GRTUSDT"},
+    {"id": "immutable-x",               "symbol": "IMX",     "bybit": "IMXUSDT"},
+    {"id": "thorchain",                 "symbol": "RUNE",    "bybit": "RUNEUSDT"},
+    {"id": "mantle",                    "symbol": "MNT",     "bybit": "MNTUSDT"},
+    {"id": "ondo-finance",              "symbol": "ONDO",    "bybit": "ONDOUSDT"},
+    {"id": "raydium",                   "symbol": "RAY",     "bybit": "RAYUSDT"},
+    {"id": "curve-dao-token",           "symbol": "CRV",     "bybit": "CRVUSDT"},
+    {"id": "lido-dao",                  "symbol": "LDO",     "bybit": "LDOUSDT"},
+    {"id": "fetch-ai",                  "symbol": "FET",     "bybit": "FETUSDT"},
+    {"id": "matic-network",             "symbol": "POL",     "bybit": "POLUSDT"},
+    {"id": "ronin",                     "symbol": "RON",     "bybit": "RONUSDT"},
+    {"id": "terra-luna-2",              "symbol": "LUNA",    "bybit": "LUNAUSDT"},
+    {"id": "kava",                      "symbol": "KAVA",    "bybit": "KAVAUSDT"},
+    {"id": "iota",                      "symbol": "IOTA",    "bybit": "IOTAUSDT"},
+    {"id": "neo",                       "symbol": "NEO",     "bybit": "NEOUSDT"},
+    {"id": "dash",                      "symbol": "DASH",    "bybit": "DASHUSDT"},
+    {"id": "zcash",                     "symbol": "ZEC",     "bybit": "ZECUSDT"},
+    {"id": "sushi",                     "symbol": "SUSHI",   "bybit": "SUSHIUSDT"},
+    {"id": "eos",                       "symbol": "EOS",     "bybit": "EOSUSDT"},
+    {"id": "ontology",                  "symbol": "ONT",     "bybit": "ONTUSDT"},
+    {"id": "waves",                     "symbol": "WAVES",   "bybit": "WAVESUSDT"},
+    {"id": "gmx",                       "symbol": "GMX",     "bybit": "GMXUSDT"},
+    {"id": "dydx-chain",                "symbol": "DYDX",    "bybit": "DYDXUSDT"},
+    {"id": "pendle",                    "symbol": "PENDLE",  "bybit": "PENDLEUSDT"},
+    {"id": "worldcoin-wld",             "symbol": "WLD",     "bybit": "WLDUSDT"},
+    {"id": "jupiter-exchange-solana",   "symbol": "JUP",     "bybit": "JUPUSDT"},
+    {"id": "dogwifcoin",                "symbol": "WIF",     "bybit": "WIFUSDT"},
+    # ── 61-100 ──
+    {"id": "ankr",                      "symbol": "ANKR",    "bybit": "ANKRUSDT"},
+    {"id": "enjincoin",                 "symbol": "ENJ",     "bybit": "ENJUSDT"},
+    {"id": "conflux-token",             "symbol": "CFX",     "bybit": "CFXUSDT"},
+    {"id": "trust-wallet-token",        "symbol": "TWT",     "bybit": "TWTUSDT"},
+    {"id": "1inch",                     "symbol": "1INCH",   "bybit": "1INCHUSDT"},
+    {"id": "gala",                      "symbol": "GALA",    "bybit": "GALAUSDT"},
+    {"id": "chiliz",                    "symbol": "CHZ",     "bybit": "CHZUSDT"},
+    {"id": "band-protocol",             "symbol": "BAND",    "bybit": "BANDUSDT"},
+    {"id": "nervos-network",            "symbol": "CKB",     "bybit": "CKBUSDT"},
+    {"id": "zilliqa",                   "symbol": "ZIL",     "bybit": "ZILUSDT"},
+    {"id": "vechain",                   "symbol": "VET",     "bybit": "VETUSDT"},
+    {"id": "helium",                    "symbol": "HNT",     "bybit": "HNTUSDT"},
+    {"id": "floki",                     "symbol": "FLOKI",   "bybit": "FLOKIUSDT"},
+    {"id": "woo-network",               "symbol": "WOO",     "bybit": "WOOUSDT"},
+    {"id": "ocean-protocol",            "symbol": "OCEAN",   "bybit": "OCEANUSDT"},
+    {"id": "singularitynet",            "symbol": "AGIX",    "bybit": "AGIXUSDT"},
+    {"id": "api3",                      "symbol": "API3",    "bybit": "API3USDT"},
+    {"id": "blur",                      "symbol": "BLUR",    "bybit": "BLURUSDT"},
+    {"id": "arkham",                    "symbol": "ARKM",    "bybit": "ARKMUSDT"},
+    {"id": "akash-network",             "symbol": "AKT",     "bybit": "AKTUSDT"},
+    {"id": "axie-infinity",             "symbol": "AXS",     "bybit": "AXSUSDT"},
+    {"id": "sandbox",                   "symbol": "SAND",    "bybit": "SANDUSDT"},
+    {"id": "decentraland",              "symbol": "MANA",    "bybit": "MANAUSDT"},
+    {"id": "flow",                      "symbol": "FLOW",    "bybit": "FLOWUSDT"},
+    {"id": "oasis-network",             "symbol": "ROSE",    "bybit": "ROSEUSDT"},
+    {"id": "kusama",                    "symbol": "KSM",     "bybit": "KSMUSDT"},
+    {"id": "pyth-network",              "symbol": "PYTH",    "bybit": "PYTHUSDT"},
+    {"id": "compound-governance-token", "symbol": "COMP",    "bybit": "COMPUSDT"},
+    {"id": "yearn-finance",             "symbol": "YFI",     "bybit": "YFIUSDT"},
+    {"id": "wormhole",                  "symbol": "W",       "bybit": "WUSDT"},
+    {"id": "io-net",                    "symbol": "IO",      "bybit": "IOUSDT"},
+    {"id": "notcoin",                   "symbol": "NOT",     "bybit": "NOTUSDT"},
+    {"id": "zksync",                    "symbol": "ZK",      "bybit": "ZKUSDT"},
+    {"id": "raydium",                   "symbol": "RAY",     "bybit": "RAYUSDT"},
+    {"id": "tensor",                    "symbol": "TNSR",    "bybit": "TNSRUSDT"},
+    {"id": "portal",                    "symbol": "PORTAL",  "bybit": "PORTALUSDT"},
+    {"id": "dogwifcoin",                "symbol": "WIF",     "bybit": "WIFUSDT"},
+    {"id": "coredaoorg",                "symbol": "CORE",    "bybit": "COREUSDT"},
+    {"id": "bitcoin-cash",              "symbol": "BCH",     "bybit": "BCHUSDT"},
+    {"id": "maker",                     "symbol": "MKR",     "bybit": "MKRUSDT"},
+    # ── 101-150 ──
+    {"id": "algorand",                  "symbol": "ALGO",    "bybit": "ALGOUSDT"},
+    {"id": "iota",                      "symbol": "IOTA",    "bybit": "IOTAUSDT"},
+    {"id": "theta-token",               "symbol": "THETA",   "bybit": "THETAUSDT"},
+    {"id": "elrond-erd-2",              "symbol": "EGLD",    "bybit": "EGLDUSDT"},
+    {"id": "loopring",                  "symbol": "LRC",     "bybit": "LRCUSDT"},
+    {"id": "basic-attention-token",     "symbol": "BAT",     "bybit": "BATUSDT"},
+    {"id": "iotex",                     "symbol": "IOTX",    "bybit": "IOTXUSDT"},
+    {"id": "ren",                       "symbol": "REN",     "bybit": "RENUSDT"},
+    {"id": "storj",                     "symbol": "STORJ",   "bybit": "STORJUSDT"},
+    {"id": "celo",                      "symbol": "CELO",    "bybit": "CELOSDT"},
+    {"id": "harmony",                   "symbol": "ONE",     "bybit": "ONEUSDT"},
+    {"id": "qtum",                      "symbol": "QTUM",    "bybit": "QTUMUSDT"},
+    {"id": "icon",                      "symbol": "ICX",     "bybit": "ICXUSDT"},
+    {"id": "ontology-gas",              "symbol": "ONG",     "bybit": "ONGUSDT"},
+    {"id": "zeta-chain",                "symbol": "ZETA",    "bybit": "ZETAUSDT"},
+    {"id": "ssv-network",               "symbol": "SSV",     "bybit": "SSVUSDT"},
+    {"id": "civic",                     "symbol": "CVC",     "bybit": "CVCUSDT"},
+    {"id": "dusk-network",              "symbol": "DUSK",    "bybit": "DUSKUSDT"},
+    {"id": "nkn",                       "symbol": "NKN",     "bybit": "NKNUSDT"},
+    {"id": "spell-token",               "symbol": "SPELL",   "bybit": "SPELLUSDT"},
+    {"id": "audius",                    "symbol": "AUDIO",   "bybit": "AUDIOUSDT"},
+    {"id": "alchemy-pay",               "symbol": "ACH",     "bybit": "ACHUSDT"},
+    {"id": "nervos-network",            "symbol": "CKB",     "bybit": "CKBUSDT"},
+    {"id": "verge",                     "symbol": "XVG",     "bybit": "XVGUSDT"},
+    {"id": "ripple",                    "symbol": "XRP",     "bybit": "XRPUSDT"},
+    {"id": "venus",                     "symbol": "XVS",     "bybit": "XVSUSDT"},
+    {"id": "dego-finance",              "symbol": "DEGO",    "bybit": "DEGOUSDT"},
+    {"id": "alpaca-finance",            "symbol": "ALPACA",  "bybit": "ALPACAUSDT"},
+    {"id": "cream-finance",             "symbol": "CREAM",   "bybit": "CREAMUSDT"},
+    {"id": "biswap",                    "symbol": "BSW",     "bybit": "BSWUSDT"},
+    {"id": "truefi",                    "symbol": "TRU",     "bybit": "TRUUSDT"},
+    {"id": "lazio-fan-token",           "symbol": "LAZIO",   "bybit": "LAZIOUSDT"},
+    {"id": "mobox",                     "symbol": "MBOX",    "bybit": "MBOXUSDT"},
+    {"id": "prom",                      "symbol": "PROM",    "bybit": "PROMUSDT"},
+    {"id": "voxies",                    "symbol": "VOXEL",   "bybit": "VOXELUSDT"},
+    {"id": "highstreet",                "symbol": "HIGH",    "bybit": "HIGHUSDT"},
+    {"id": "beta-finance",              "symbol": "BETA",    "bybit": "BETAUSDT"},
+    {"id": "football-fan-token",        "symbol": "PORTO",   "bybit": "PORTOUSDT"},
+    {"id": "chess",                     "symbol": "CHESS",   "bybit": "CHESSUSDT"},
+    {"id": "klay-token",                "symbol": "KLAY",    "bybit": "KLAYUSDT"},
+    # ── 151-200 ──
+    {"id": "spell-token",               "symbol": "SPELL",   "bybit": "SPELLUSDT"},
+    {"id": "cocos-bcx",                 "symbol": "COCOS",   "bybit": "COCOSUSDT"},
+    {"id": "derace",                    "symbol": "DERACE",  "bybit": "DERACEUSDT"},
+    {"id": "orion-protocol",            "symbol": "ORN",     "bybit": "ORNUSDT"},
+    {"id": "litentry",                  "symbol": "LIT",     "bybit": "LITUSDT"},
+    {"id": "phala-network",             "symbol": "PHA",     "bybit": "PHAUSDT"},
+    {"id": "clv-p",                     "symbol": "CLV",     "bybit": "CLVUSDT"},
+    {"id": "bifrost-native-coin",       "symbol": "BNC",     "bybit": "BNCUSDT"},
+    {"id": "xdefi-wallet",              "symbol": "XDEFI",   "bybit": "XDEFIUSDT"},
+    {"id": "reef",                      "symbol": "REEF",    "bybit": "REEFUSDT"},
+    {"id": "superverse",                "symbol": "SUPER",   "bybit": "SUPERUSDT"},
+    {"id": "swipe",                     "symbol": "SXP",     "bybit": "SXPUSDT"},
+    {"id": "ageur",                     "symbol": "AGEUR",   "bybit": "AGEURUSDT"},
+    {"id": "stafi",                     "symbol": "FIS",     "bybit": "FISUSDT"},
+    {"id": "loka",                      "symbol": "LOKA",    "bybit": "LOKAUSDT"},
+    {"id": "bounce-token",              "symbol": "AUCTION", "bybit": "AUCTIONUSDT"},
+    {"id": "prosper",                   "symbol": "PROS",    "bybit": "PROSUSDT"},
+    {"id": "dfx-finance",               "symbol": "DFX",     "bybit": "DFXUSDT"},
+    {"id": "nuls",                      "symbol": "NULS",    "bybit": "NULSUSDT"},
+    {"id": "step-finance",              "symbol": "STEP",    "bybit": "STEPUSDT"},
+    {"id": "alphalink",                 "symbol": "ALPHA",   "bybit": "ALPHAUSDT"},
+    {"id": "tornado-cash",              "symbol": "TORN",    "bybit": "TORNUSDT"},
+    {"id": "dodo",                      "symbol": "DODO",    "bybit": "DODOUSDT"},
+    {"id": "burger-swap",               "symbol": "BURGER",  "bybit": "BURGERUSDT"},
+    {"id": "automata",                  "symbol": "ATA",     "bybit": "ATAUSDT"},
+    {"id": "gas",                       "symbol": "GAS",     "bybit": "GASUSDT"},
+    {"id": "loom-network-new",          "symbol": "LOOM",    "bybit": "LOOMUSDT"},
+    {"id": "bluzelle",                  "symbol": "BLZ",     "bybit": "BLZUSDT"},
+    {"id": "polymath-network",          "symbol": "POLY",    "bybit": "POLYUSDT"},
+    {"id": "venus-btc",                 "symbol": "VBTC",    "bybit": "VBTCUSDT"},
+    {"id": "joe",                       "symbol": "JOE",     "bybit": "JOEUSDT"},
+    {"id": "hegic",                     "symbol": "HEGIC",   "bybit": "HEGICUSDT"},
+    {"id": "mdex",                      "symbol": "MDX",     "bybit": "MDXUSDT"},
+    {"id": "ribbon-finance",            "symbol": "RBN",     "bybit": "RBNUSDT"},
+    {"id": "tornado-cash",              "symbol": "TORN",    "bybit": "TORNUSDT"},
+    {"id": "unifi-protocol-dao",        "symbol": "UNFI",    "bybit": "UNFIUSDT"},
+    {"id": "terra-luna-2",              "symbol": "LUNA",    "bybit": "LUNAUSDT"},
+    {"id": "synapse-2",                 "symbol": "SYN",     "bybit": "SYNUSDT"},
+    {"id": "bezoge-earth",              "symbol": "BEZOGE",  "bybit": "BEZOGEUSDT"},
+    {"id": "boba-network",              "symbol": "BOBA",    "bybit": "BOBAUSDT"},
+    {"id": "measurable-data-token",     "symbol": "MDT",     "bybit": "MDTUSDT"},
+    {"id": "vite",                      "symbol": "VITE",    "bybit": "VITEUSDT"},
+    {"id": "wazirx",                    "symbol": "WRX",     "bybit": "WRXUSDT"},
+    {"id": "dfi-money",                 "symbol": "YFII",    "bybit": "YFIIUSDT"},
+    {"id": "barnbridge",                "symbol": "BOND",    "bybit": "BONDUSDT"},
+    {"id": "xyo-network",               "symbol": "XYO",     "bybit": "XYOUSDT"},
+    {"id": "telos",                     "symbol": "TLOS",    "bybit": "TLOSUSDT"},
+    {"id": "oraichain-token",           "symbol": "ORAI",    "bybit": "ORAIUSDT"},
+    {"id": "hifi-finance",              "symbol": "HIFI",    "bybit": "HIFIUSDT"},
+    {"id": "magic",                     "symbol": "MAGIC",   "bybit": "MAGICUSDT"},
 ]
+
+# Remove exact duplicates keeping first occurrence
+_seen = set()
+_deduped = []
+for c in COINS:
+    if c["symbol"] not in _seen:
+        _seen.add(c["symbol"])
+        _deduped.append(c)
+COINS = _deduped
 
 session = requests.Session()
 
@@ -537,6 +683,23 @@ def make_pre_warn(coin, direction, price):
     )
 
 
+def make_signal_id(sym):
+    """Generate a short unique signal ID e.g. SOL-0417-1423"""
+    now = datetime.now(timezone.utc)
+    return f"{sym}-{now.strftime('%m%d')}-{now.strftime('%H%M')}"
+
+
+def tp_progress_bar(tp_hit, direction):
+    """Visual TP progress — e.g. TP1✅ TP2✅ TP3⬜ TP4⬜"""
+    icons = []
+    for i in range(1, 5):
+        if i <= tp_hit:
+            icons.append(f"TP{i}✅")
+        else:
+            icons.append(f"TP{i}⬜")
+    return "  ".join(icons)
+
+
 def make_signal_msg(coin, sig, price, change):
     action    = sig["signal"]
     sign      = "+" if change >= 0 else ""
@@ -549,6 +712,7 @@ def make_signal_msg(coin, sig, price, change):
     tp_pcts   = sig.get("tp_pcts", [0, 0, 0, 0])
     arrow     = "🟢" if action == "BUY" else "🔴"
     side_word = "LONG" if action == "BUY" else "SHORT"
+    sig_id    = sig.get("sig_id", make_signal_id(coin["symbol"]))
 
     rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
     ema_str = ("↑ Uptrend" if ema20 > ema50 else "↓ Downtrend") if (ema20 and ema50) else "N/A"
@@ -559,7 +723,7 @@ def make_signal_msg(coin, sig, price, change):
     notional   = trade_size * LEVERAGE
 
     return (
-        f"<b>📝 PAPER TRADE — APEX SIGNAL</b>\n"
+        f"<b>📝 APEX SIGNAL — #{sig_id}</b>\n"
         f"══════════════════════════════\n"
         f"{arrow} <b>{side_word} — {coin['symbol']}/USDT</b>\n\n"
         f"⚙️ {LEVERAGE}x Leverage | ${trade_size:.0f} margin → ${notional:.0f} exposure\n\n"
@@ -581,11 +745,12 @@ def make_signal_msg(coin, sig, price, change):
     )
 
 
-def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pnl_usdt, new_sl=None):
+def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pnl_usdt, new_sl=None, sig_id=None, tp_hit_total=0):
     arrow     = "🟢" if direction == "BUY" else "🔴"
     side_word = "LONG" if direction == "BUY" else "SHORT"
     sl_note   = f"\n💡 SL → {fmt_p(new_sl)} (breakeven)" if tp_num == 1 and new_sl else \
                 f"\n💡 SL trailed to TP{tp_num - 1}" if tp_num > 1 and new_sl else ""
+    id_line   = f"#{sig_id}  |  " if sig_id else ""
 
     with state_lock:
         total      = stats["total"]
@@ -596,24 +761,29 @@ def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pn
         balance    = paper_balance
 
     entry_note = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
+    progress   = tp_progress_bar(tp_hit_total, direction)
 
     return (
-        f"<b>✅ TP{tp_num} HIT — {sym} {side_word}</b> {arrow}\n\n"
-        f"[PAPER TRADE]\n"
-        f"Entry: {fmt_p(entry)}{entry_note} → TP{tp_num}: {fmt_p(tp_price)}\n"
-        f"Time: {elapsed_str(elapsed)}\n"
-        f"Est. +${pnl_usdt:.2f} USDT (25% of position){sl_note}\n\n"
+        f"<b>✅ TP{tp_num} HIT — {sym} {side_word}</b> {arrow}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 {id_line}Entry: {fmt_p(entry)}{entry_note}\n"
+        f"{progress}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"TP{tp_num} hit: {fmt_p(tp_price)}\n"
+        f"Time in trade: {elapsed_str(elapsed)}\n"
+        f"Est. +${pnl_usdt:.2f} USDT (25% closed){sl_note}\n\n"
         f"📊 Session stats:\n"
-        f"Win rate: {trades_won}/{total} trades won = {win_rate}%\n"
+        f"Win rate: {trades_won}/{total} = {win_rate}%\n"
         f"Net P&L: {net_sign}${abs(net_pnl):.2f} USDT\n"
         f"Balance: ${balance:.2f} USDT"
     )
 
 
-def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, breakeven=False):
+def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, breakeven=False, sig_id=None, tp_hit_total=0):
     side_word = "LONG" if direction == "BUY" else "SHORT"
-    be_str    = " (at breakeven — no loss!)" if breakeven else ""
+    be_str    = " (breakeven — no loss!)" if breakeven else ""
     sign      = "+" if breakeven else "-"
+    id_line   = f"#{sig_id}  |  " if sig_id else ""
 
     with state_lock:
         total      = stats["total"]
@@ -624,15 +794,19 @@ def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, 
         balance    = paper_balance
 
     entry_note = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
+    progress   = tp_progress_bar(tp_hit_total, direction)
 
     return (
-        f"<b>{'✅' if breakeven else '❌'} SL HIT{be_str} — {sym} {side_word}</b>\n\n"
-        f"[PAPER TRADE]\n"
-        f"Entry: {fmt_p(entry)}{entry_note} → SL: {fmt_p(sl_price)}\n"
-        f"Time: {elapsed_str(elapsed)}\n"
+        f"<b>{'✅' if breakeven else '❌'} SL HIT{be_str} — {sym} {side_word}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 {id_line}Entry: {fmt_p(entry)}{entry_note}\n"
+        f"{progress}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"SL hit: {fmt_p(sl_price)}\n"
+        f"Time in trade: {elapsed_str(elapsed)}\n"
         f"Est. {sign}${pnl_usdt:.2f} USDT\n\n"
         f"📊 Session stats:\n"
-        f"Win rate: {trades_won}/{total} trades won = {win_rate}%\n"
+        f"Win rate: {trades_won}/{total} = {win_rate}%\n"
         f"Net P&L: {net_sign}${abs(net_pnl):.2f} USDT\n"
         f"Balance: ${balance:.2f} USDT"
     )
@@ -659,12 +833,13 @@ def paper_execute(coin, sig, price):
     else:
         liq_price = round(exec_price * (1 + 0.9 / LEVERAGE), 8)
 
-    # FIX: state mutations under lock, TG notification built then sent OUTSIDE lock
+    # All state mutations under lock; TG calls outside to avoid holding lock during HTTP
     with state_lock:
         if paper_balance < trade_size:
             bal_snap = paper_balance
         else:
             bal_snap = None
+            sig_id   = sig.get("sig_id", make_signal_id(sym))
             paper_balance -= trade_size
             stats["pnl_history"].append(round(paper_balance, 2))
             positions[sym] = {
@@ -686,6 +861,7 @@ def paper_execute(coin, sig, price):
                 "opened_at":               time.time(),
                 "funding_periods_charged": 0,
                 "currentPnl":              0.0,
+                "sig_id":                  sig_id,
             }
             bal_after  = paper_balance
             open_count = len(positions)
@@ -705,21 +881,20 @@ def paper_execute(coin, sig, price):
                 if abs(exec_price - price) / price > 0.0001 else ""
 
     tg_send(
-        f"<b>📝 PAPER TRADE ENTERED — {sym}</b>\n\n"
+        f"<b>📝 PAPER TRADE ENTERED — #{sig_id}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢' if direction == 'BUY' else '🔴'} <b>{side_word} {sym}/USDT</b>\n\n"
         f"Signal price: {fmt_p(price)}{slip_note}\n"
         f"Margin:    ${trade_size:.0f} USDT\n"
-        f"Exposure:  ${notional:.0f} USDT ({LEVERAGE}x)\n"
-        f"Qty:       {qty}\n\n"
+        f"Exposure:  ${notional:.0f} USDT ({LEVERAGE}x)\n\n"
         f"TP1: {fmt_p(sig['tp1'])}  ({lev_ret[0]}% levered)\n"
         f"TP2: {fmt_p(sig['tp2'])}  ({lev_ret[1]}% levered)\n"
         f"TP3: {fmt_p(sig['tp3'])}  ({lev_ret[2]}% levered)\n"
         f"TP4: {fmt_p(sig['tp4'])}  ({lev_ret[3]}% levered)\n"
         f"SL:  {fmt_p(sig['sl'])}\n"
         f"Liq: {fmt_p(liq_price)}\n\n"
-        f"💰 Paper balance: ${bal_after:.2f} USDT\n"
-        f"Open trades: {open_count}\n\n"
-        f"🤖 Bot monitors: auto TP/SL + trailing stop"
+        f"💰 Balance: ${bal_after:.2f} USDT  |  Open: {open_count}\n"
+        f"🤖 Monitoring: auto TP/SL + trailing stop"
     )
     print(f"  📝 Paper trade: {direction} {sym} @ {exec_price} (signal {price}) qty={qty}")
     return True
@@ -786,8 +961,11 @@ def monitor_positions(prices):
                     "time": utc_now_str(),
                 })
                 notifications.append(
-                    f"<b>💀 LIQUIDATED — {sym}</b>\n\n"
-                    f"[PAPER TRADE]\n"
+                    f"<b>💀 LIQUIDATED — {sym}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 #{pos.get('sig_id', '?')}  |  Entry: {fmt_p(entry)}\n"
+                    f"{tp_progress_bar(tp_hit, direction)}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"Price hit liquidation at {fmt_p(liq_price)}\n"
                     f"Margin lost: ${remaining_margin:.2f} USDT\n\n"
                     f"Balance: ${paper_balance:.2f} USDT"
@@ -825,7 +1003,8 @@ def monitor_positions(prices):
                 # Build message inside lock (reads stats), send outside
                 notifications.append(
                     make_sl_msg(sym, direction, entry, exec_price, sl,
-                                elapsed, pnl_usdt, pos.get("breakeven"))
+                                elapsed, pnl_usdt, pos.get("breakeven"),
+                                sig_id=pos.get("sig_id"), tp_hit_total=tp_hit)
                 )
                 to_remove.append(sym)
                 continue
@@ -882,11 +1061,14 @@ def monitor_positions(prices):
                     win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
                     net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
                     notifications.append(
-                        f"<b>🎯 ALL 4 TPs HIT — {sym}!</b>\n\n"
-                        f"[PAPER TRADE]\n"
-                        f"Full trade complete — perfect signal!\n\n"
+                        f"<b>🎯 ALL 4 TPs HIT — {sym}!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📌 #{pos.get('sig_id', '?')}  |  Entry: {fmt_p(entry)}\n"
+                        f"{tp_progress_bar(4, direction)}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"[PAPER TRADE] Perfect signal!\n\n"
                         f"📊 Session stats:\n"
-                        f"Win rate: {trades_won}/{total} trades won = {win_rate}%\n"
+                        f"Win rate: {trades_won}/{total} = {win_rate}%\n"
                         f"Net P&L: +${net_pnl:.2f} USDT\n"
                         f"Balance: ${paper_balance:.2f} USDT"
                     )
@@ -894,7 +1076,8 @@ def monitor_positions(prices):
                 else:
                     notifications.append(
                         make_tp_msg(sym, direction, tp_num, entry, exec_price,
-                                    next_tp, elapsed, pnl_usdt, new_sl)
+                                    next_tp, elapsed, pnl_usdt, new_sl,
+                                    sig_id=pos.get("sig_id"), tp_hit_total=tp_num)
                     )
                     print(f"  TP{tp_num} hit: {sym} @ ${price}")
 
@@ -1056,6 +1239,7 @@ def run():
                             pre_warned.pop(sym, None)
 
                         sig["entry"]     = price
+                        sig["sig_id"]    = make_signal_id(sym)
                         last_signal[sym] = sig
 
                         tg_send(make_signal_msg(coin, sig, price, change))
