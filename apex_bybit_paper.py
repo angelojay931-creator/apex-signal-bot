@@ -309,12 +309,18 @@ def check_circuit_breakers(scan_prices=None):
     global risk_state
 
     with state_lock:
-        balance = paper_balance
+        free_cash      = paper_balance
+        # Total capital = free cash + all margin currently deployed in open positions
+        # This prevents deployed margin being mistaken for losses
+        deployed_margin = sum(pos.get("margin", 0) * (1.0 - pos.get("tp_hit", 0) * 0.25)
+                              for pos in positions.values())
+        total_capital  = free_cash + deployed_margin
 
     start_bal = risk_state["session_start_balance"]
 
     # ── 1. Daily loss limit ──
-    drawdown_pct = (balance - start_bal) / start_bal * 100
+    # Use total capital (free + deployed) so open positions don't trigger false alarms
+    drawdown_pct = (total_capital - start_bal) / start_bal * 100
     if drawdown_pct <= -(MAX_DAILY_LOSS_PCT * 100):
         if not risk_state["trading_paused"]:
             reason = f"Daily loss limit hit ({drawdown_pct:.1f}% drawdown)"
@@ -323,7 +329,8 @@ def check_circuit_breakers(scan_prices=None):
             tg_send(
                 f"<b>🛑 CIRCUIT BREAKER — Trading Paused</b>\n\n"
                 f"Reason: {reason}\n"
-                f"Balance: ${balance:.2f} USDT\n"
+                f"Free cash: ${free_cash:.2f} USDT\n"
+                f"Total capital: ${total_capital:.2f} USDT\n"
                 f"Started: ${start_bal:.2f} USDT\n\n"
                 f"<i>Bot will resume scanning but not open new trades.</i>"
             )
