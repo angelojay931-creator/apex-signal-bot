@@ -26,24 +26,24 @@ from flask import Flask, jsonify
 
 # ─────────────────────────── CONFIG ───────────────────────────
 PAPER_TRADING  = True
-PAPER_BALANCE  = 1000.0        # Simulated balance: $1000 USDT
+PAPER_BALANCE  = 2000.0        # Simulated balance: $2,000 USDT
 
 BYBIT_KEY    = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_SECRET = os.environ.get("BYBIT_SECRET", "").strip()
 TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-TRADE_SIZE         = 100.0     # Fixed $100 USDT margin per trade
-USE_DYNAMIC_SIZING = False     # Fixed sizing — $100 always
-RISK_PCT           = 0.10      # Unused when dynamic sizing is off
-MIN_TRADE_SIZE     = 100.0
-MAX_TRADE_SIZE     = 100.0
+TRADE_SIZE         = 150.0     # $150 margin per trade (7.5% of balance)
+USE_DYNAMIC_SIZING = False     # Fixed $150 always
+RISK_PCT           = 0.075     # Unused — dynamic sizing off
+MIN_TRADE_SIZE     = 150.0
+MAX_TRADE_SIZE     = 150.0
 
-LEVERAGE           = 3         # 3x → $300 exposure per trade
+LEVERAGE           = 5         # 5x → $750 exposure per trade
 MIN_CONF           = 85
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
-MAX_OPEN_TRADES    = 8         # 8 × $100 = $800 max deployed ($200 kept in reserve)
+MAX_OPEN_TRADES    = 8         # 8 × $150 = $1,200 deployed ($800 reserve)
 
 SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
@@ -201,77 +201,40 @@ COINS = [
     {"id": "civic",                     "symbol": "CVC",     "bybit": "CVCUSDT"},
     {"id": "dusk-network",              "symbol": "DUSK",    "bybit": "DUSKUSDT"},
     {"id": "nkn",                       "symbol": "NKN",     "bybit": "NKNUSDT"},
-    {"id": "spell-token",               "symbol": "SPELL",   "bybit": "SPELLUSDT"},
     {"id": "audius",                    "symbol": "AUDIO",   "bybit": "AUDIOUSDT"},
     {"id": "alchemy-pay",               "symbol": "ACH",     "bybit": "ACHUSDT"},
     {"id": "nervos-network",            "symbol": "CKB",     "bybit": "CKBUSDT"},
-    {"id": "verge",                     "symbol": "XVG",     "bybit": "XVGUSDT"},
-    {"id": "ripple",                    "symbol": "XRP",     "bybit": "XRPUSDT"},
     {"id": "venus",                     "symbol": "XVS",     "bybit": "XVSUSDT"},
-    {"id": "dego-finance",              "symbol": "DEGO",    "bybit": "DEGOUSDT"},
     {"id": "alpaca-finance",            "symbol": "ALPACA",  "bybit": "ALPACAUSDT"},
-    {"id": "cream-finance",             "symbol": "CREAM",   "bybit": "CREAMUSDT"},
     {"id": "biswap",                    "symbol": "BSW",     "bybit": "BSWUSDT"},
     {"id": "truefi",                    "symbol": "TRU",     "bybit": "TRUUSDT"},
-    {"id": "lazio-fan-token",           "symbol": "LAZIO",   "bybit": "LAZIOUSDT"},
-    {"id": "mobox",                     "symbol": "MBOX",    "bybit": "MBOXUSDT"},
-    {"id": "prom",                      "symbol": "PROM",    "bybit": "PROMUSDT"},
-    {"id": "voxies",                    "symbol": "VOXEL",   "bybit": "VOXELUSDT"},
-    {"id": "highstreet",                "symbol": "HIGH",    "bybit": "HIGHUSDT"},
-    {"id": "beta-finance",              "symbol": "BETA",    "bybit": "BETAUSDT"},
-    {"id": "football-fan-token",        "symbol": "PORTO",   "bybit": "PORTOUSDT"},
-    {"id": "chess",                     "symbol": "CHESS",   "bybit": "CHESSUSDT"},
-    {"id": "klay-token",                "symbol": "KLAY",    "bybit": "KLAYUSDT"},
     # ── 151-200 ──
-    {"id": "spell-token",               "symbol": "SPELL",   "bybit": "SPELLUSDT"},
-    {"id": "cocos-bcx",                 "symbol": "COCOS",   "bybit": "COCOSUSDT"},
-    {"id": "derace",                    "symbol": "DERACE",  "bybit": "DERACEUSDT"},
     {"id": "orion-protocol",            "symbol": "ORN",     "bybit": "ORNUSDT"},
     {"id": "litentry",                  "symbol": "LIT",     "bybit": "LITUSDT"},
     {"id": "phala-network",             "symbol": "PHA",     "bybit": "PHAUSDT"},
     {"id": "clv-p",                     "symbol": "CLV",     "bybit": "CLVUSDT"},
-    {"id": "bifrost-native-coin",       "symbol": "BNC",     "bybit": "BNCUSDT"},
-    {"id": "xdefi-wallet",              "symbol": "XDEFI",   "bybit": "XDEFIUSDT"},
     {"id": "reef",                      "symbol": "REEF",    "bybit": "REEFUSDT"},
     {"id": "superverse",                "symbol": "SUPER",   "bybit": "SUPERUSDT"},
     {"id": "swipe",                     "symbol": "SXP",     "bybit": "SXPUSDT"},
-    {"id": "ageur",                     "symbol": "AGEUR",   "bybit": "AGEURUSDT"},
     {"id": "stafi",                     "symbol": "FIS",     "bybit": "FISUSDT"},
     {"id": "loka",                      "symbol": "LOKA",    "bybit": "LOKAUSDT"},
     {"id": "bounce-token",              "symbol": "AUCTION", "bybit": "AUCTIONUSDT"},
-    {"id": "prosper",                   "symbol": "PROS",    "bybit": "PROSUSDT"},
-    {"id": "dfx-finance",               "symbol": "DFX",     "bybit": "DFXUSDT"},
     {"id": "nuls",                      "symbol": "NULS",    "bybit": "NULSUSDT"},
-    {"id": "step-finance",              "symbol": "STEP",    "bybit": "STEPUSDT"},
     {"id": "alphalink",                 "symbol": "ALPHA",   "bybit": "ALPHAUSDT"},
-    {"id": "tornado-cash",              "symbol": "TORN",    "bybit": "TORNUSDT"},
     {"id": "dodo",                      "symbol": "DODO",    "bybit": "DODOUSDT"},
-    {"id": "burger-swap",               "symbol": "BURGER",  "bybit": "BURGERUSDT"},
     {"id": "automata",                  "symbol": "ATA",     "bybit": "ATAUSDT"},
     {"id": "gas",                       "symbol": "GAS",     "bybit": "GASUSDT"},
     {"id": "loom-network-new",          "symbol": "LOOM",    "bybit": "LOOMUSDT"},
     {"id": "bluzelle",                  "symbol": "BLZ",     "bybit": "BLZUSDT"},
-    {"id": "polymath-network",          "symbol": "POLY",    "bybit": "POLYUSDT"},
-    {"id": "venus-btc",                 "symbol": "VBTC",    "bybit": "VBTCUSDT"},
     {"id": "joe",                       "symbol": "JOE",     "bybit": "JOEUSDT"},
-    {"id": "hegic",                     "symbol": "HEGIC",   "bybit": "HEGICUSDT"},
-    {"id": "mdex",                      "symbol": "MDX",     "bybit": "MDXUSDT"},
-    {"id": "ribbon-finance",            "symbol": "RBN",     "bybit": "RBNUSDT"},
-    {"id": "tornado-cash",              "symbol": "TORN",    "bybit": "TORNUSDT"},
     {"id": "unifi-protocol-dao",        "symbol": "UNFI",    "bybit": "UNFIUSDT"},
-    {"id": "terra-luna-2",              "symbol": "LUNA",    "bybit": "LUNAUSDT"},
     {"id": "synapse-2",                 "symbol": "SYN",     "bybit": "SYNUSDT"},
-    {"id": "bezoge-earth",              "symbol": "BEZOGE",  "bybit": "BEZOGEUSDT"},
     {"id": "boba-network",              "symbol": "BOBA",    "bybit": "BOBAUSDT"},
     {"id": "measurable-data-token",     "symbol": "MDT",     "bybit": "MDTUSDT"},
-    {"id": "vite",                      "symbol": "VITE",    "bybit": "VITEUSDT"},
     {"id": "wazirx",                    "symbol": "WRX",     "bybit": "WRXUSDT"},
-    {"id": "dfi-money",                 "symbol": "YFII",    "bybit": "YFIIUSDT"},
     {"id": "barnbridge",                "symbol": "BOND",    "bybit": "BONDUSDT"},
-    {"id": "xyo-network",               "symbol": "XYO",     "bybit": "XYOUSDT"},
     {"id": "telos",                     "symbol": "TLOS",    "bybit": "TLOSUSDT"},
     {"id": "oraichain-token",           "symbol": "ORAI",    "bybit": "ORAIUSDT"},
-    {"id": "hifi-finance",              "symbol": "HIFI",    "bybit": "HIFIUSDT"},
     {"id": "magic",                     "symbol": "MAGIC",   "bybit": "MAGICUSDT"},
 ]
 
@@ -321,7 +284,7 @@ def calc_trade_size():
     return TRADE_SIZE
 
 
-# ──────────────────────── RSI / EMA ───────────────────────────
+# ──────────────────── RSI / EMA / MACD / ATR / BB / OBV ──────────────────────
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -357,7 +320,125 @@ def calc_volume_ratio(volumes):
     return round(volumes[-1] / avg, 2) if avg > 0 else 1.0
 
 
-def get_candles(symbol_usdt, interval="1h", limit=60):
+def calc_macd(closes, fast=12, slow=26, signal=9):
+    """
+    MACD = EMA(12) - EMA(26)
+    Signal = EMA(9) of MACD
+    Returns: (macd_val, signal_val, histogram, is_bullish_cross)
+    """
+    if len(closes) < slow + signal:
+        return None, None, None, None
+    ema_fast   = calc_ema(closes, fast)
+    ema_slow   = calc_ema(closes, slow)
+    if ema_fast is None or ema_slow is None:
+        return None, None, None, None
+    # Build MACD line history for signal calculation
+    macd_line = []
+    for i in range(slow - 1, len(closes)):
+        ef = calc_ema(closes[:i+1], fast)
+        es = calc_ema(closes[:i+1], slow)
+        if ef and es:
+            macd_line.append(ef - es)
+    if len(macd_line) < signal:
+        return None, None, None, None
+    macd_val   = round(macd_line[-1], 8)
+    signal_val = round(calc_ema(macd_line, signal) or 0, 8)
+    histogram  = round(macd_val - signal_val, 8)
+    # Bullish cross: MACD just crossed above signal
+    is_bullish = macd_val > signal_val
+    return macd_val, signal_val, histogram, is_bullish
+
+
+def calc_atr(candles, period=14):
+    """
+    ATR = Average True Range over period candles
+    True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+    Uses close as proxy since we only have OHLCV from Binance
+    Returns ATR value and ATR as % of current price
+    """
+    if len(candles) < period + 1:
+        return None, None
+    trs = []
+    for i in range(1, len(candles)):
+        high  = candles[i].get("high",  candles[i]["close"] * 1.005)
+        low   = candles[i].get("low",   candles[i]["close"] * 0.995)
+        prev_c = candles[i-1]["close"]
+        tr = max(
+            high - low,
+            abs(high - prev_c),
+            abs(low  - prev_c),
+        )
+        trs.append(tr)
+    # Wilder smoothing
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    current_price = candles[-1]["close"]
+    atr_pct = round(atr / current_price * 100, 4) if current_price > 0 else None
+    return round(atr, 8), atr_pct
+
+
+def calc_bollinger(closes, period=20, std_dev=2.0):
+    """
+    Bollinger Bands: middle=SMA(20), upper/lower = ±2 std devs
+    Returns: (upper, middle, lower, bandwidth, is_expanding)
+    bandwidth = (upper-lower)/middle — wider = more volatile/expanding
+    """
+    if len(closes) < period:
+        return None, None, None, None, None
+    window  = closes[-period:]
+    middle  = sum(window) / period
+    variance = sum((x - middle) ** 2 for x in window) / period
+    std     = variance ** 0.5
+    upper   = round(middle + std_dev * std, 8)
+    lower   = round(middle - std_dev * std, 8)
+    middle  = round(middle, 8)
+    bandwidth = round((upper - lower) / middle * 100, 4) if middle > 0 else 0
+    # Compare to previous bandwidth to detect expansion
+    if len(closes) >= period + 5:
+        prev_window = closes[-(period+5):-5]
+        prev_mid    = sum(prev_window) / period
+        prev_var    = sum((x - prev_mid) ** 2 for x in prev_window) / period
+        prev_std    = prev_var ** 0.5
+        prev_bw     = (prev_std * 2 * std_dev) / prev_mid * 100 if prev_mid > 0 else 0
+        is_expanding = bandwidth > prev_bw
+    else:
+        is_expanding = True
+    return upper, middle, lower, bandwidth, is_expanding
+
+
+def calc_obv(closes, volumes):
+    """
+    OBV: cumulative volume — add on up days, subtract on down days
+    Returns: (current_obv, obv_trend) where trend is 'rising', 'falling', 'flat'
+    """
+    if len(closes) < 2 or len(volumes) < 2:
+        return None, None
+    obv = 0.0
+    obv_history = [0.0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i-1]:
+            obv += volumes[i]
+        elif closes[i] < closes[i-1]:
+            obv -= volumes[i]
+        obv_history.append(obv)
+    # Trend: compare last 5 OBV values to previous 5
+    if len(obv_history) >= 10:
+        recent = sum(obv_history[-5:]) / 5
+        prev   = sum(obv_history[-10:-5]) / 5
+        if recent > prev * 1.01:
+            trend = "rising"
+        elif recent < prev * 0.99:
+            trend = "falling"
+        else:
+            trend = "flat"
+    else:
+        trend = "rising" if obv > 0 else "flat"
+    return round(obv, 2), trend
+
+
+def get_candles(symbol_usdt, interval="1h", limit=80):
+    """Fetch full OHLCV candles — now includes high/low for ATR."""
     try:
         r = session.get(
             "https://api.binance.com/api/v3/klines",
@@ -367,23 +448,60 @@ def get_candles(symbol_usdt, interval="1h", limit=60):
         data = r.json()
         if not isinstance(data, list):
             return None
-        return [{"close": float(c[4]), "volume": float(c[5])} for c in data]
+        return [
+            {
+                "open":   float(c[1]),
+                "high":   float(c[2]),
+                "low":    float(c[3]),
+                "close":  float(c[4]),
+                "volume": float(c[5]),
+            }
+            for c in data
+        ]
     except Exception as e:
         print(f"  Candle error {symbol_usdt}: {e}")
         return None
 
 
 def get_ta(symbol):
-    candles = get_candles(symbol + "USDT", "1h", 60)
-    if not candles or len(candles) < 20:
+    """
+    Full technical analysis — all 7 indicators:
+    RSI, EMA20/50, MACD, ATR, Bollinger Bands, OBV
+    """
+    candles = get_candles(symbol + "USDT", "1h", 80)
+    if not candles or len(candles) < 30:
         return None
     closes  = [c["close"]  for c in candles]
     volumes = [c["volume"] for c in candles]
+
+    rsi    = calc_rsi(closes, 14)
+    ema20  = calc_ema(closes, 20)
+    ema50  = calc_ema(closes, 50) if len(closes) >= 50 else None
+    vol_r  = calc_volume_ratio(volumes)
+
+    macd_val, signal_val, histogram, macd_bullish = calc_macd(closes)
+    atr_val, atr_pct                              = calc_atr(candles, 14)
+    bb_upper, bb_mid, bb_lower, bb_bw, bb_expand = calc_bollinger(closes, 20)
+    obv_val, obv_trend                            = calc_obv(closes, volumes)
+
     return {
-        "rsi":       calc_rsi(closes, 14),
-        "ema20":     calc_ema(closes, 20),
-        "ema50":     calc_ema(closes, 50) if len(closes) >= 50 else None,
-        "vol_ratio": calc_volume_ratio(volumes),
+        "rsi":          rsi,
+        "ema20":        ema20,
+        "ema50":        ema50,
+        "vol_ratio":    vol_r,
+        # NEW indicators
+        "macd":         macd_val,
+        "macd_signal":  signal_val,
+        "macd_hist":    histogram,
+        "macd_bullish": macd_bullish,   # True=bullish, False=bearish
+        "atr":          atr_val,
+        "atr_pct":      atr_pct,        # ATR as % of price
+        "bb_upper":     bb_upper,
+        "bb_lower":     bb_lower,
+        "bb_bw":        bb_bw,          # bandwidth %
+        "bb_expanding": bb_expand,      # True = expanding = real move
+        "obv":          obv_val,
+        "obv_trend":    obv_trend,      # 'rising'/'falling'/'flat'
     }
 
 
@@ -444,7 +562,47 @@ def get_prices():
 
 
 # ──────────────────────── SIGNAL ENGINE ───────────────────────
-def calc_levels(price, direction, rsi, vol_ratio):
+# ATR minimum threshold — below this = flat/dead market = no trade
+ATR_MIN_PCT = 0.3   # 0.3% minimum ATR — skip signals in sleeping markets
+
+# TP probability estimates based on historical hit rates
+# These are calibrated estimates — will improve over time
+TP_PROB = {
+    "tp1": {"high": 91, "med": 85, "low": 78},
+    "tp2": {"high": 82, "med": 74, "low": 65},
+}
+
+
+def calc_tp_probability(conf, vol_ratio, macd_bullish, bb_expanding):
+    """
+    Estimate TP1 and TP2 hit probability based on signal strength.
+    More confirmations = higher probability.
+    """
+    # Base from confidence score
+    if conf >= 92:    base = "high"
+    elif conf >= 87:  base = "med"
+    else:             base = "low"
+
+    tp1_prob = TP_PROB["tp1"][base]
+    tp2_prob = TP_PROB["tp2"][base]
+
+    # Bonus for extra confirmations
+    bonus = 0
+    if vol_ratio and vol_ratio > 2:   bonus += 2
+    if macd_bullish is not None:       bonus += 2
+    if bb_expanding:                   bonus += 1
+
+    tp1_prob = min(96, tp1_prob + bonus)
+    tp2_prob = min(90, tp2_prob + bonus)
+    return tp1_prob, tp2_prob
+
+
+def calc_levels(price, direction, rsi, vol_ratio, atr_pct=None):
+    """
+    Calculate TP1-4 and SL.
+    SL is now ATR-based (dynamic) when ATR data available.
+    Fixed % fallback when ATR not available.
+    """
     base = 0.025
     if vol_ratio and vol_ratio > 3:       base = 0.042
     elif vol_ratio and vol_ratio > 2:     base = 0.034
@@ -455,13 +613,22 @@ def calc_levels(price, direction, rsi, vol_ratio):
         tp2 = round(price * (1 + base * 0.70), 8)
         tp3 = round(price * (1 + base * 1.00), 8)
         tp4 = round(price * (1 + base * 1.50), 8)
-        sl  = round(price * (1 - base * 0.60), 8)
+        # ATR SL: use 2× ATR if available, else fixed 1.0%
+        if atr_pct and atr_pct > 0:
+            sl_pct = min(max(atr_pct * 2, 0.4), 1.5)  # clamp 0.4%-1.5%
+        else:
+            sl_pct = 1.0
+        sl = round(price * (1 - sl_pct / 100), 8)
     else:
         tp1 = round(price * (1 - base * 0.40), 8)
         tp2 = round(price * (1 - base * 0.70), 8)
         tp3 = round(price * (1 - base * 1.00), 8)
         tp4 = round(price * (1 - base * 1.50), 8)
-        sl  = round(price * (1 + base * 0.60), 8)
+        if atr_pct and atr_pct > 0:
+            sl_pct = min(max(atr_pct * 2, 0.4), 1.5)
+        else:
+            sl_pct = 1.0
+        sl = round(price * (1 + sl_pct / 100), 8)
 
     tp_pcts = [
         round(abs(tp1 - price) / price * 100, 2),
@@ -469,18 +636,29 @@ def calc_levels(price, direction, rsi, vol_ratio):
         round(abs(tp3 - price) / price * 100, 2),
         round(abs(tp4 - price) / price * 100, 2),
     ]
-    return {"tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "sl": sl, "tp_pcts": tp_pcts}
+    sl_pct_actual = round(abs(sl - price) / price * 100, 2)
+    return {
+        "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4,
+        "sl": sl, "sl_pct": sl_pct_actual, "tp_pcts": tp_pcts,
+    }
 
 
 def build_signal(price, change, high, low, vol, ta):
+    """
+    APEX v3 Signal Engine — 7 indicator filters:
+    RSI + EMA + Volume + MACD + ATR + Bollinger + OBV
+    ALL must confirm before signal fires.
+    """
     if not price:
         return None
+
     high = high or price * 1.02
     low  = low  or price * 0.98
     rng  = high - low
     pos  = (price - low) / rng if rng > 0 else 0.5
     score = 0
 
+    # ── 1. Momentum (24h change) ──
     if change > 8:     score += 6
     elif change > 6:   score += 5
     elif change > 4:   score += 4
@@ -492,28 +670,45 @@ def build_signal(price, change, high, low, vol, ta):
     else:
         return None
 
+    # ── 2. Range position ──
     if pos < 0.15:   score += 4
     elif pos < 0.25: score += 3
     elif pos > 0.90: score -= 3
     elif pos > 0.80: score -= 2
 
+    # ── 3. Volume (24h) ──
     if vol and vol > 2_000_000_000:   score += 3
     elif vol and vol > 1_000_000_000: score += 2
     elif vol and vol > 500_000_000:   score += 1
     else:                              score -= 2
 
-    rsi       = (ta or {}).get("rsi")
-    ema20     = (ta or {}).get("ema20")
-    ema50     = (ta or {}).get("ema50")
-    vol_ratio = (ta or {}).get("vol_ratio", 1.0)
+    # Extract all TA values
+    rsi          = (ta or {}).get("rsi")
+    ema20        = (ta or {}).get("ema20")
+    ema50        = (ta or {}).get("ema50")
+    vol_ratio    = (ta or {}).get("vol_ratio", 1.0)
+    macd_bullish = (ta or {}).get("macd_bullish")
+    macd_hist    = (ta or {}).get("macd_hist")
+    atr_pct      = (ta or {}).get("atr_pct")
+    bb_expanding = (ta or {}).get("bb_expanding")
+    bb_bw        = (ta or {}).get("bb_bw")
+    obv_trend    = (ta or {}).get("obv_trend")
 
+    # ── 4. ATR flat market filter (NEW) ──
+    # If market is sleeping (ATR too low) → skip entirely
+    if atr_pct is not None and atr_pct < ATR_MIN_PCT:
+        print(f"    ATR flat market veto ({atr_pct:.3f}% < {ATR_MIN_PCT}%)")
+        return None
+
+    # ── 5. RSI hard veto ──
     if score > 0 and rsi and rsi > 75:
-        print(f"    RSI veto BUY ({rsi:.1f})")
+        print(f"    RSI veto BUY ({rsi:.1f} overbought)")
         return None
     if score < 0 and rsi and rsi < 25:
-        print(f"    RSI veto SELL ({rsi:.1f})")
+        print(f"    RSI veto SELL ({rsi:.1f} oversold)")
         return None
 
+    # ── 6. RSI confirmation ──
     if score > 0 and rsi:
         if rsi < 40:   score += 2
         elif rsi < 50: score += 1
@@ -521,15 +716,39 @@ def build_signal(price, change, high, low, vol, ta):
         if rsi > 60:   score -= 2
         elif rsi > 50: score -= 1
 
+    # ── 7. EMA trend ──
     if ema20 and ema50:
         if score > 0 and ema20 > ema50: score += 1
         if score < 0 and ema20 < ema50: score -= 1
 
+    # ── 8. Volume spike bonus ──
     if vol_ratio and vol_ratio > 3:
         score = score + 2 if score > 0 else score - 2
     elif vol_ratio and vol_ratio > 2:
         score = score + 1 if score > 0 else score - 1
 
+    # ── 9. MACD confirmation (NEW) ──
+    if macd_bullish is not None:
+        if score > 0 and macd_bullish:      score += 2  # bullish cross = BUY confirmed
+        elif score > 0 and not macd_bullish: score -= 1  # MACD bearish = weaken BUY
+        if score < 0 and not macd_bullish:  score -= 2  # bearish cross = SELL confirmed
+        elif score < 0 and macd_bullish:    score += 1  # MACD bullish = weaken SELL
+
+    # ── 10. Bollinger Bands expansion (NEW) ──
+    if bb_expanding is not None:
+        if bb_expanding:
+            score = score + 1 if score > 0 else score - 1   # expanding = real move
+        else:
+            score = score - 1 if score > 0 else score + 1   # contracting = fake move
+
+    # ── 11. OBV trend confirmation (NEW) ──
+    if obv_trend:
+        if score > 0 and obv_trend == "rising":   score += 1  # real buying
+        elif score > 0 and obv_trend == "falling": score -= 2  # fake pump
+        if score < 0 and obv_trend == "falling":  score -= 1  # real selling
+        elif score < 0 and obv_trend == "rising":  score += 2  # fake dump
+
+    # ── 12. Score → direction + confidence ──
     if score >= 7:
         conf = min(95, 70 + score * 3);      direction = "BUY"
     elif score >= 5:
@@ -541,20 +760,38 @@ def build_signal(price, change, high, low, vol, ta):
     else:
         return None
 
-    levels = calc_levels(price, direction, rsi, vol_ratio)
+    levels   = calc_levels(price, direction, rsi, vol_ratio, atr_pct)
+    tp1_prob, tp2_prob = calc_tp_probability(
+        conf, vol_ratio, macd_bullish, bb_expanding
+    )
+
     return {
-        "signal":    direction,
-        "conf":      conf,
-        "rsi":       rsi,
-        "ema20":     ema20,
-        "ema50":     ema50,
-        "vol_ratio": vol_ratio,
-        "tp1":       levels["tp1"],
-        "tp2":       levels["tp2"],
-        "tp3":       levels["tp3"],
-        "tp4":       levels["tp4"],
-        "sl":        levels["sl"],
-        "tp_pcts":   levels["tp_pcts"],
+        "signal":       direction,
+        "conf":         conf,
+        "score":        score,
+        # Original indicators
+        "rsi":          rsi,
+        "ema20":        ema20,
+        "ema50":        ema50,
+        "vol_ratio":    vol_ratio,
+        # New indicators
+        "macd_bullish": macd_bullish,
+        "macd_hist":    macd_hist,
+        "atr_pct":      atr_pct,
+        "bb_expanding": bb_expanding,
+        "bb_bw":        bb_bw,
+        "obv_trend":    obv_trend,
+        # Levels
+        "tp1":          levels["tp1"],
+        "tp2":          levels["tp2"],
+        "tp3":          levels["tp3"],
+        "tp4":          levels["tp4"],
+        "sl":           levels["sl"],
+        "sl_pct":       levels["sl_pct"],
+        "tp_pcts":      levels["tp_pcts"],
+        # Probability
+        "tp1_prob":     tp1_prob,
+        "tp2_prob":     tp2_prob,
     }
 
 
@@ -575,23 +812,33 @@ def get_data():
 
         open_pos = {}
         for sym, pos in positions.items():
+            realized   = pos.get("currentPnl", 0)
+            unrealized = pos.get("unrealized_pnl", 0)   # updated live by monitor loop
+            rem_pct    = 1.0 - (pos.get("tp_hit", 0) * 0.25)
             open_pos[sym] = {
-                "sym":        sym,
-                "direction":  pos["direction"],
-                "entry":      pos["entry"],
-                "execPrice":  pos["exec_price"],
-                "tp1":        pos["tp1"],
-                "tp2":        pos["tp2"],
-                "tp3":        pos["tp3"],
-                "tp4":        pos["tp4"],
-                "sl":         pos["sl"],
-                "liqPrice":   pos["liq_price"],
-                "tpHit":      pos["tp_hit"],
-                "breakeven":  pos.get("breakeven", False),
-                "margin":     pos["margin"],
-                "currentPnl": pos.get("currentPnl", 0),
-                "openTime":   pos.get("opened_at", 0),
+                "sym":           sym,
+                "direction":     pos.get("direction", ""),
+                "entry":         pos.get("entry", 0),
+                "execPrice":     pos.get("exec_price", 0),
+                "tp1":           pos.get("tp1", 0),
+                "tp2":           pos.get("tp2", 0),
+                "tp3":           pos.get("tp3", 0),
+                "tp4":           pos.get("tp4", 0),
+                "sl":            pos.get("sl", 0),
+                "liqPrice":      pos.get("liq_price", 0),
+                "tpHit":         pos.get("tp_hit", 0),
+                "breakeven":     pos.get("breakeven", False),
+                "margin":        pos.get("margin", float(TRADE_SIZE)),
+                "realizedPnl":   round(realized, 2),
+                "unrealizedPnl": round(unrealized, 2),
+                "totalPnl":      round(realized + unrealized, 2),
+                "remainingPct":  round(rem_pct * 100),
+                "openTime":      pos.get("opened_at", 0),
+                "sigId":         pos.get("sig_id", ""),
             }
+
+        # Cap pnl_history at 500 points to prevent unbounded memory growth
+        pnl_hist = stats["pnl_history"][-500:]
 
         payload = {
             "balance":       paper_balance,
@@ -606,7 +853,7 @@ def get_data():
             "lossUsdt":      stats["loss_usdt"],
             "openPositions": open_pos,
             "closedTrades":  stats["trades_list"][-50:],
-            "pnlHistory":    stats["pnl_history"],
+            "pnlHistory":    pnl_hist,
             "leverage":      LEVERAGE,
             "tradeSize":     TRADE_SIZE,
             "timestamp":     utc_now_str(),
@@ -701,51 +948,67 @@ def tp_progress_bar(tp_hit, direction):
 
 
 def make_signal_msg(coin, sig, price, change):
-    action    = sig["signal"]
-    sign      = "+" if change >= 0 else ""
-    conf      = sig["conf"]
-    bars      = "#" * int(conf / 10) + "-" * (10 - int(conf / 10))
-    rsi       = sig.get("rsi")
-    ema20     = sig.get("ema20")
-    ema50     = sig.get("ema50")
-    vol_ratio = sig.get("vol_ratio", 1.0)
-    tp_pcts   = sig.get("tp_pcts", [0, 0, 0, 0])
-    arrow     = "🟢" if action == "BUY" else "🔴"
-    side_word = "LONG" if action == "BUY" else "SHORT"
-    sig_id    = sig.get("sig_id", make_signal_id(coin["symbol"]))
+    action       = sig["signal"]
+    sign         = "+" if change >= 0 else ""
+    conf         = sig["conf"]
+    bars         = "#" * int(conf / 10) + "-" * (10 - int(conf / 10))
+    rsi          = sig.get("rsi")
+    ema20        = sig.get("ema20")
+    ema50        = sig.get("ema50")
+    vol_ratio    = sig.get("vol_ratio", 1.0)
+    tp_pcts      = sig.get("tp_pcts", [0, 0, 0, 0])
+    macd_bullish = sig.get("macd_bullish")
+    atr_pct      = sig.get("atr_pct")
+    bb_expanding = sig.get("bb_expanding")
+    obv_trend    = sig.get("obv_trend")
+    tp1_prob     = sig.get("tp1_prob", 85)
+    tp2_prob     = sig.get("tp2_prob", 75)
+    sl_pct       = sig.get("sl_pct", 1.0)
+    arrow        = "🟢" if action == "BUY" else "🔴"
+    side_word    = "LONG" if action == "BUY" else "SHORT"
+    sig_id       = sig.get("sig_id", make_signal_id(coin["symbol"]))
 
-    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
-    ema_str = ("↑ Uptrend" if ema20 > ema50 else "↓ Downtrend") if (ema20 and ema50) else "N/A"
-    vol_str = f"{vol_ratio:.1f}x avg" if vol_ratio else "N/A"
-    lev_ret = [round(p * LEVERAGE, 1) for p in tp_pcts]
+    rsi_str  = f"{rsi:.1f}" if rsi is not None else "N/A"
+    ema_str  = ("↑ Uptrend" if ema20 > ema50 else "↓ Downtrend") if (ema20 and ema50) else "N/A"
+    vol_str  = f"{vol_ratio:.1f}x avg" if vol_ratio else "N/A"
+    macd_str = ("✅ Bullish" if macd_bullish else "⚠️ Bearish") if macd_bullish is not None else "N/A"
+    atr_str  = f"{atr_pct:.2f}%" if atr_pct else "N/A"
+    bb_str   = ("✅ Expanding" if bb_expanding else "⚠️ Contracting") if bb_expanding is not None else "N/A"
+    obv_str  = ("✅ Rising" if obv_trend == "rising" else
+                "⚠️ Falling" if obv_trend == "falling" else "➡️ Flat") if obv_trend else "N/A"
 
-    trade_size = calc_trade_size()
-    notional   = trade_size * LEVERAGE
+    lev_ret      = [round(p * LEVERAGE, 1) for p in tp_pcts]
+    trade_size   = calc_trade_size()
+    notional     = trade_size * LEVERAGE
 
     return (
-        f"<b>📝 APEX SIGNAL — #{sig_id}</b>\n"
+        f"<b>⚡ APEX SIGNAL — #{sig_id}</b>\n"
         f"══════════════════════════════\n"
         f"{arrow} <b>{side_word} — {coin['symbol']}/USDT</b>\n\n"
-        f"⚙️ {LEVERAGE}x Leverage | ${trade_size:.0f} margin → ${notional:.0f} exposure\n\n"
+        f"⚙️ {LEVERAGE}x | ${trade_size:.0f} margin → ${notional:.0f} exposure\n\n"
         f"Entry:     {fmt_p(price)}\n"
-        f"Target 1:  {fmt_p(sig['tp1'])}  (+{tp_pcts[0]}% | {lev_ret[0]}% levered)\n"
-        f"Target 2:  {fmt_p(sig['tp2'])}  (+{tp_pcts[1]}% | {lev_ret[1]}% levered)\n"
-        f"Target 3:  {fmt_p(sig['tp3'])}  (+{tp_pcts[2]}% | {lev_ret[2]}% levered)\n"
-        f"Target 4:  {fmt_p(sig['tp4'])}  (+{tp_pcts[3]}% | {lev_ret[3]}% levered)\n"
-        f"Stop Loss: {fmt_p(sig['sl'])}\n\n"
+        f"SL:        {fmt_p(sig['sl'])}  (-{sl_pct:.2f}% ATR)\n\n"
+        f"TP1: {fmt_p(sig['tp1'])}  {tp1_prob}% prob  (+{tp_pcts[0]}% | {lev_ret[0]}% levered)\n"
+        f"TP2: {fmt_p(sig['tp2'])}  {tp2_prob}% prob  (+{tp_pcts[1]}% | {lev_ret[1]}% levered)\n"
+        f"TP3: {fmt_p(sig['tp3'])}               (+{tp_pcts[2]}% | {lev_ret[2]}% levered)\n"
+        f"TP4: {fmt_p(sig['tp4'])}               (+{tp_pcts[3]}% | {lev_ret[3]}% levered)\n\n"
         f"📊 Indicators:\n"
-        f"RSI(14):   {rsi_str}\n"
-        f"EMA trend: {ema_str}\n"
-        f"Volume:    {vol_str}\n"
-        f"24h:       {sign}{round(change, 2)}%\n\n"
+        f"RSI(14):  {rsi_str}\n"
+        f"EMA:      {ema_str}\n"
+        f"MACD:     {macd_str}\n"
+        f"BB:       {bb_str}\n"
+        f"OBV:      {obv_str}\n"
+        f"ATR:      {atr_str}\n"
+        f"Volume:   {vol_str}\n"
+        f"24h:      {sign}{round(change, 2)}%\n\n"
         f"Confidence: {conf}%  [{bars}]\n\n"
-        f"🤖 <i>Paper trade auto-entered instantly</i>\n"
+        f"🤖 <i>Paper trade auto-entered</i>\n"
         f"══════════════════════════════\n"
         f"Time: {utc_now_str()}"
     )
 
 
-def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pnl_usdt, new_sl=None, sig_id=None, tp_hit_total=0):
+def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pnl_usdt, new_sl=None, sig_id=None, tp_hit_total=0, trade_pnl_so_far=0):
     arrow     = "🟢" if direction == "BUY" else "🔴"
     side_word = "LONG" if direction == "BUY" else "SHORT"
     sl_note   = f"\n💡 SL → {fmt_p(new_sl)} (breakeven)" if tp_num == 1 and new_sl else \
@@ -760,8 +1023,9 @@ def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pn
         net_sign   = "+" if net_pnl >= 0 else ""
         balance    = paper_balance
 
-    entry_note = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
-    progress   = tp_progress_bar(tp_hit_total, direction)
+    entry_note  = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
+    progress    = tp_progress_bar(tp_hit_total, direction)
+    total_so_far = round(trade_pnl_so_far, 2)
 
     return (
         f"<b>✅ TP{tp_num} HIT — {sym} {side_word}</b> {arrow}\n"
@@ -771,7 +1035,8 @@ def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pn
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"TP{tp_num} hit: {fmt_p(tp_price)}\n"
         f"Time in trade: {elapsed_str(elapsed)}\n"
-        f"Est. +${pnl_usdt:.2f} USDT (25% closed){sl_note}\n\n"
+        f"This close:    +${pnl_usdt:.2f} USDT{sl_note}\n"
+        f"Trade P&L so far: +${total_so_far:.2f} USDT\n\n"
         f"📊 Session stats:\n"
         f"Win rate: {trades_won}/{total} = {win_rate}%\n"
         f"Net P&L: {net_sign}${abs(net_pnl):.2f} USDT\n"
@@ -779,11 +1044,10 @@ def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pn
     )
 
 
-def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, breakeven=False, sig_id=None, tp_hit_total=0):
-    side_word = "LONG" if direction == "BUY" else "SHORT"
-    be_str    = " (breakeven — no loss!)" if breakeven else ""
-    sign      = "+" if breakeven else "-"
-    id_line   = f"#{sig_id}  |  " if sig_id else ""
+def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, breakeven=False, sig_id=None, tp_hit_total=0, trade_pnl_so_far=0):
+    side_word  = "LONG" if direction == "BUY" else "SHORT"
+    be_str     = " (breakeven — no loss!)" if breakeven else ""
+    id_line    = f"#{sig_id}  |  " if sig_id else ""
 
     with state_lock:
         total      = stats["total"]
@@ -793,18 +1057,22 @@ def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, 
         net_sign   = "+" if net_pnl >= 0 else ""
         balance    = paper_balance
 
-    entry_note = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
-    progress   = tp_progress_bar(tp_hit_total, direction)
+    entry_note   = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
+    progress     = tp_progress_bar(tp_hit_total, direction)
+    total_pnl    = round(trade_pnl_so_far + (pnl_usdt if breakeven else -pnl_usdt), 2)
+    total_sign   = "+" if total_pnl >= 0 else ""
+    icon         = "✅" if total_pnl >= 0 else "❌"
 
     return (
-        f"<b>{'✅' if breakeven else '❌'} SL HIT{be_str} — {sym} {side_word}</b>\n"
+        f"<b>{icon} SL HIT{be_str} — {sym} {side_word}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 {id_line}Entry: {fmt_p(entry)}{entry_note}\n"
         f"{progress}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"SL hit: {fmt_p(sl_price)}\n"
         f"Time in trade: {elapsed_str(elapsed)}\n"
-        f"Est. {sign}${pnl_usdt:.2f} USDT\n\n"
+        f"This close: {'breakeven' if breakeven else f'-${pnl_usdt:.2f} USDT'}\n"
+        f"<b>Total trade: {total_sign}${abs(total_pnl):.2f} USDT</b>\n\n"
         f"📊 Session stats:\n"
         f"Win rate: {trades_won}/{total} = {win_rate}%\n"
         f"Net P&L: {net_sign}${abs(net_pnl):.2f} USDT\n"
@@ -932,6 +1200,16 @@ def monitor_positions(prices):
         tp_levels  = [pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"]]
         trade_size = pos["margin"]
 
+        # ── Live unrealized PnL on remaining open position ──
+        remaining_pct = 1.0 - (tp_hit * 0.25)
+        if direction == "BUY":
+            live_move_pct = (price - exec_price) / exec_price * 100
+        else:
+            live_move_pct = (exec_price - price) / exec_price * 100
+        unrealized = round(trade_size * LEVERAGE * live_move_pct / 100 * remaining_pct, 2)
+        # Store on pos so /data endpoint serves fresh value
+        pos["unrealized_pnl"] = unrealized
+
         with state_lock:
             # ── Funding deduction every 8 hours ──
             funding_due = int(elapsed / 28800)
@@ -994,6 +1272,9 @@ def monitor_positions(prices):
 
                 stats["total"]  += 1
                 stats["sl_hit"] += 1
+                # Count as won if SL closed in profit (breakeven or trailing above entry)
+                if is_profit or pos.get("first_tp_counted"):
+                    stats["trades_won"] += 1
                 stats["pnl_history"].append(round(paper_balance, 2))
                 stats["trades_list"].append({
                     "sym": sym, "direction": direction, "result": "SL",
@@ -1004,7 +1285,8 @@ def monitor_positions(prices):
                 notifications.append(
                     make_sl_msg(sym, direction, entry, exec_price, sl,
                                 elapsed, pnl_usdt, pos.get("breakeven"),
-                                sig_id=pos.get("sig_id"), tp_hit_total=tp_hit)
+                                sig_id=pos.get("sig_id"), tp_hit_total=tp_hit,
+                                trade_pnl_so_far=pos.get("currentPnl", 0))
                 )
                 to_remove.append(sym)
                 continue
@@ -1030,9 +1312,8 @@ def monitor_positions(prices):
                 stats["pnl_history"].append(round(paper_balance, 2))
                 pos["currentPnl"]     = pos.get("currentPnl", 0) + pnl_usdt
 
-                # FIX: increment trades_won on first TP hit (once per trade)
+                # Mark first TP hit (used to set breakeven SL)
                 if not pos["first_tp_counted"]:
-                    stats["trades_won"]    += 1
                     pos["first_tp_counted"] = True
 
                 # Trail SL
@@ -1051,7 +1332,8 @@ def monitor_positions(prices):
                 pos["tp_hit"] = tp_num
 
                 if tp_num == 4:
-                    stats["total"] += 1
+                    stats["total"]     += 1
+                    stats["trades_won"] += 1   # all 4 TPs = definite win
                     stats["trades_list"].append({
                         "sym": sym, "direction": direction, "result": "ALL_TP",
                         "pnl": round(pos["currentPnl"], 2), "time": utc_now_str(),
@@ -1060,13 +1342,17 @@ def monitor_positions(prices):
                     trades_won = stats["trades_won"]
                     win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
                     net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+                    trade_pnl  = round(pos["currentPnl"], 2)
+                    side_word  = "LONG" if direction == "BUY" else "SHORT"
                     notifications.append(
                         f"<b>🎯 ALL 4 TPs HIT — {sym}!</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 #{pos.get('sig_id', '?')}  |  Entry: {fmt_p(entry)}\n"
+                        f"📌 #{pos.get('sig_id', '?')}  |  {side_word}\n"
+                        f"Entry: {fmt_p(entry)} → All 4 targets hit!\n"
                         f"{tp_progress_bar(4, direction)}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"[PAPER TRADE] Perfect signal!\n\n"
+                        f"💰 This trade: <b>+${trade_pnl:.2f} USDT</b>\n"
+                        f"⏱ Time: {elapsed_str(elapsed)}\n\n"
                         f"📊 Session stats:\n"
                         f"Win rate: {trades_won}/{total} = {win_rate}%\n"
                         f"Net P&L: +${net_pnl:.2f} USDT\n"
@@ -1077,7 +1363,8 @@ def monitor_positions(prices):
                     notifications.append(
                         make_tp_msg(sym, direction, tp_num, entry, exec_price,
                                     next_tp, elapsed, pnl_usdt, new_sl,
-                                    sig_id=pos.get("sig_id"), tp_hit_total=tp_num)
+                                    sig_id=pos.get("sig_id"), tp_hit_total=tp_num,
+                                    trade_pnl_so_far=pos.get("currentPnl", 0))
                     )
                     print(f"  TP{tp_num} hit: {sym} @ ${price}")
 
@@ -1113,23 +1400,26 @@ def run():
     print(f"Dashboard API running on port {os.environ.get('PORT', 8080)}")
 
     tg_send(
-        "<b>📝 APEX Paper Trading Bot — Online!</b>\n\n"
+        "<b>⚡ APEX Bybit Bot v4 — Online!</b>\n\n"
         f"Exchange: <b>Bybit Futures (SIMULATED)</b>\n"
         f"Leverage: <b>{LEVERAGE}x</b>\n"
         f"Sizing: <b>{sizing_note}</b>\n"
         f"Starting balance: <b>${PAPER_BALANCE} USDT</b>\n"
         f"Coins monitored: <b>{len(COINS)}</b>\n"
         f"Min confidence: <b>{MIN_CONF}%</b>\n\n"
-        f"<b>Signal Engine:</b>\n"
-        f"• RSI(14) — blocks overbought/oversold\n"
-        f"• EMA 20/50 trend filter\n"
-        f"• Volume spike detection\n"
-        f"• 4-target GG Shot style signals\n"
-        f"• BUY (Long) + SELL (Short) signals\n\n"
-        f"<b>Simulation:</b>\n"
-        f"• Entry slippage: {SLIPPAGE_PCT*100:.2f}%\n"
-        f"• Funding rate: {FUNDING_RATE*100:.3f}%/8h\n"
-        f"• Liquidation price tracked\n\n"
+        f"<b>Signal Engine v4 — 7 Indicators:</b>\n"
+        f"• RSI(14) — overbought/oversold filter\n"
+        f"• EMA 20/50 — trend direction\n"
+        f"• Volume ratio — spike detection\n"
+        f"• MACD — trend confirmation ✨NEW\n"
+        f"• ATR — dynamic SL + flat filter ✨NEW\n"
+        f"• Bollinger Bands — real breakouts ✨NEW\n"
+        f"• OBV — real vs fake volume ✨NEW\n\n"
+        f"<b>Improvements:</b>\n"
+        f"• ATR-based dynamic SL (smarter exits)\n"
+        f"• Flat market filter (no dead signals)\n"
+        f"• TP1/TP2 probability % shown\n"
+        f"• Fewer signals — much higher quality\n\n"
         f"Blocked: {', '.join(BLOCKED_COINS) or 'None'}\n\n"
         f"<i>No real money at risk — pure data collection!</i>"
     )
@@ -1212,10 +1502,13 @@ def run():
 
                         ta = ta_map.get(sym)
                         if ta:
-                            trend = "↑" if ta.get("ema20") and ta.get("ema50") and \
-                                          ta["ema20"] > ta["ema50"] else "↓"
-                            print(f" | RSI={ta.get('rsi','?')} EMA={trend} "
-                                  f"Vol={ta.get('vol_ratio', 1.0):.1f}x", end="")
+                            trend    = "↑" if ta.get("ema20") and ta.get("ema50") and ta["ema20"] > ta["ema50"] else "↓"
+                            macd_c   = "M✅" if ta.get("macd_bullish") else "M⚠️"
+                            bb_c     = "BB✅" if ta.get("bb_expanding") else "BB⚠️"
+                            obv_c    = "OBV✅" if ta.get("obv_trend") == "rising" else "OBV⚠️"
+                            atr_val  = ta.get("atr_pct")
+                            atr_c    = f"ATR={atr_val:.2f}%" if atr_val is not None else "ATR=N/A"
+                            print(f" | RSI={ta.get('rsi','?')} EMA={trend} {macd_c} {bb_c} {obv_c} {atr_c}", end="")
 
                         sig = build_signal(price, change, high, low, vol, ta)
                         print()
