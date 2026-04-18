@@ -51,6 +51,13 @@ PRE_WARN_TTL       = 7200
 
 BLOCKED_COINS = {"ENJ"}
 
+# ─────────────── PROFESSIONAL RISK MANAGEMENT ─────────────────
+# Circuit breakers — protect capital when things go wrong
+MAX_DAILY_LOSS_PCT  = 0.08   # Stop new signals if down >8% in a day
+MAX_CONSEC_LOSSES   = 3      # Pause after 3 consecutive SL hits
+MAX_TRADE_HOURS     = 48     # Force-close positions open > 48 hours
+BTC_CRASH_PCT       = -5.0   # Pause new signals if BTC drops >5% in 1h
+
 # ─────────────────────────── STATE ────────────────────────────
 # RLock: reentrant — make_tp_msg/make_sl_msg re-acquire inside monitor_positions
 state_lock    = threading.RLock()
@@ -71,6 +78,16 @@ stats = {
 }
 
 last_signal = {}
+
+# ───────────────── RISK MANAGEMENT STATE ──────────────────────
+risk_state = {
+    "session_start_balance": PAPER_BALANCE,  # reset on bot start
+    "consec_losses":         0,              # consecutive SL hits
+    "trading_paused":        False,          # circuit breaker flag
+    "pause_reason":          "",             # why trading is paused
+    "btc_last_price":        None,           # for BTC crash detection
+    "btc_last_check":        0.0,            # timestamp of last BTC check
+}
 
 # ─────────────────────────── COINS ────────────────────────────
 # Top 200 coins by market cap — stablecoins and wrapped tokens excluded
@@ -174,16 +191,13 @@ COINS = [
     {"id": "io-net",                    "symbol": "IO",      "bybit": "IOUSDT"},
     {"id": "notcoin",                   "symbol": "NOT",     "bybit": "NOTUSDT"},
     {"id": "zksync",                    "symbol": "ZK",      "bybit": "ZKUSDT"},
-    {"id": "raydium",                   "symbol": "RAY",     "bybit": "RAYUSDT"},
     {"id": "tensor",                    "symbol": "TNSR",    "bybit": "TNSRUSDT"},
     {"id": "portal",                    "symbol": "PORTAL",  "bybit": "PORTALUSDT"},
-    {"id": "dogwifcoin",                "symbol": "WIF",     "bybit": "WIFUSDT"},
     {"id": "coredaoorg",                "symbol": "CORE",    "bybit": "COREUSDT"},
     {"id": "bitcoin-cash",              "symbol": "BCH",     "bybit": "BCHUSDT"},
     {"id": "maker",                     "symbol": "MKR",     "bybit": "MKRUSDT"},
     # ── 101-150 ──
     {"id": "algorand",                  "symbol": "ALGO",    "bybit": "ALGOUSDT"},
-    {"id": "iota",                      "symbol": "IOTA",    "bybit": "IOTAUSDT"},
     {"id": "theta-token",               "symbol": "THETA",   "bybit": "THETAUSDT"},
     {"id": "elrond-erd-2",              "symbol": "EGLD",    "bybit": "EGLDUSDT"},
     {"id": "loopring",                  "symbol": "LRC",     "bybit": "LRCUSDT"},
@@ -191,7 +205,7 @@ COINS = [
     {"id": "iotex",                     "symbol": "IOTX",    "bybit": "IOTXUSDT"},
     {"id": "ren",                       "symbol": "REN",     "bybit": "RENUSDT"},
     {"id": "storj",                     "symbol": "STORJ",   "bybit": "STORJUSDT"},
-    {"id": "celo",                      "symbol": "CELO",    "bybit": "CELOSDT"},
+    {"id": "celo",                      "symbol": "CELO",    "bybit": "CELOUSDT"},
     {"id": "harmony",                   "symbol": "ONE",     "bybit": "ONEUSDT"},
     {"id": "qtum",                      "symbol": "QTUM",    "bybit": "QTUMUSDT"},
     {"id": "icon",                      "symbol": "ICX",     "bybit": "ICXUSDT"},
@@ -203,7 +217,6 @@ COINS = [
     {"id": "nkn",                       "symbol": "NKN",     "bybit": "NKNUSDT"},
     {"id": "audius",                    "symbol": "AUDIO",   "bybit": "AUDIOUSDT"},
     {"id": "alchemy-pay",               "symbol": "ACH",     "bybit": "ACHUSDT"},
-    {"id": "nervos-network",            "symbol": "CKB",     "bybit": "CKBUSDT"},
     {"id": "venus",                     "symbol": "XVS",     "bybit": "XVSUSDT"},
     {"id": "alpaca-finance",            "symbol": "ALPACA",  "bybit": "ALPACAUSDT"},
     {"id": "biswap",                    "symbol": "BSW",     "bybit": "BSWUSDT"},
@@ -284,6 +297,99 @@ def calc_trade_size():
     return TRADE_SIZE
 
 
+# ─────────────── PROFESSIONAL RISK MANAGEMENT ─────────────────
+def check_circuit_breakers(scan_prices=None):
+    """
+    Professional circuit breakers — pause trading when:
+    1. Daily drawdown > MAX_DAILY_LOSS_PCT (8%)
+    2. Consecutive SL losses >= MAX_CONSEC_LOSSES (3)
+    3. BTC drops > BTC_CRASH_PCT (-5%) in last hour
+    Returns True if trading should be paused.
+    """
+    global risk_state
+
+    with state_lock:
+        balance = paper_balance
+
+    start_bal = risk_state["session_start_balance"]
+
+    # ── 1. Daily loss limit ──
+    drawdown_pct = (balance - start_bal) / start_bal * 100
+    if drawdown_pct <= -(MAX_DAILY_LOSS_PCT * 100):
+        if not risk_state["trading_paused"]:
+            reason = f"Daily loss limit hit ({drawdown_pct:.1f}% drawdown)"
+            risk_state["trading_paused"] = True
+            risk_state["pause_reason"]   = reason
+            tg_send(
+                f"<b>🛑 CIRCUIT BREAKER — Trading Paused</b>\n\n"
+                f"Reason: {reason}\n"
+                f"Balance: ${balance:.2f} USDT\n"
+                f"Started: ${start_bal:.2f} USDT\n\n"
+                f"<i>Bot will resume scanning but not open new trades.</i>"
+            )
+        return True
+
+    # ── 2. Consecutive losses ──
+    if risk_state["consec_losses"] >= MAX_CONSEC_LOSSES:
+        if not risk_state["trading_paused"]:
+            reason = f"{MAX_CONSEC_LOSSES} consecutive SL hits"
+            risk_state["trading_paused"] = True
+            risk_state["pause_reason"]   = reason
+            tg_send(
+                f"<b>⚠️ CONSECUTIVE LOSS LIMIT — Pausing 1 hour</b>\n\n"
+                f"Reason: {reason}\n"
+                f"Balance: ${balance:.2f} USDT\n\n"
+                f"<i>Taking a break. Will auto-resume after 60 minutes.</i>"
+            )
+        return True
+
+    # ── 3. BTC crash guard ──
+    if scan_prices and time.time() - risk_state["btc_last_check"] >= 3600:
+        btc_now  = (scan_prices.get("bitcoin") or {}).get("usd")
+        btc_prev = risk_state["btc_last_price"]
+        risk_state["btc_last_check"] = time.time()
+        if btc_now:
+            risk_state["btc_last_price"] = btc_now
+            if btc_prev and btc_now > 0:
+                btc_change = (btc_now - btc_prev) / btc_prev * 100
+                if btc_change <= BTC_CRASH_PCT:
+                    if not risk_state["trading_paused"]:
+                        reason = f"BTC crashed {btc_change:.1f}% in 1h"
+                        risk_state["trading_paused"] = True
+                        risk_state["pause_reason"]   = reason
+                        tg_send(
+                            f"<b>🚨 BTC CRASH DETECTED — Pausing signals</b>\n\n"
+                            f"BTC: ${btc_prev:.0f} → ${btc_now:.0f} ({btc_change:.1f}%)\n\n"
+                            f"<i>Halting new signals until market stabilises.</i>"
+                        )
+                    return True
+
+    # ── Resume if all clear ──
+    if risk_state["trading_paused"]:
+        risk_state["trading_paused"] = False
+        risk_state["pause_reason"]   = ""
+        risk_state["consec_losses"]  = 0
+        tg_send("<b>✅ Circuit Breaker Reset — Trading Resumed</b>")
+
+    return False
+
+
+def check_stale_positions():
+    """
+    Force-close positions that have been open > MAX_TRADE_HOURS.
+    Professional traders never let a trade run indefinitely.
+    Returns list of symbols to close.
+    """
+    stale = []
+    max_seconds = MAX_TRADE_HOURS * 3600
+    with state_lock:
+        for sym, pos in positions.items():
+            age = time.time() - pos.get("opened_at", time.time())
+            if age > max_seconds:
+                stale.append(sym)
+    return stale
+
+
 # ──────────────────── RSI / EMA / MACD / ATR / BB / OBV ──────────────────────
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -322,29 +428,39 @@ def calc_volume_ratio(volumes):
 
 def calc_macd(closes, fast=12, slow=26, signal=9):
     """
-    MACD = EMA(12) - EMA(26)
-    Signal = EMA(9) of MACD
-    Returns: (macd_val, signal_val, histogram, is_bullish_cross)
+    MACD = EMA(12) - EMA(26), Signal = EMA(9) of MACD line.
+    FIX: O(n) incremental EMA — no longer recalculates full EMA per candle.
+    Returns: (macd_val, signal_val, histogram, is_bullish)
     """
     if len(closes) < slow + signal:
         return None, None, None, None
-    ema_fast   = calc_ema(closes, fast)
-    ema_slow   = calc_ema(closes, slow)
-    if ema_fast is None or ema_slow is None:
-        return None, None, None, None
-    # Build MACD line history for signal calculation
+
+    # Seed EMAs on first 'slow' candles, then roll forward
+    k_fast = 2 / (fast + 1)
+    k_slow = 2 / (slow + 1)
+    k_sig  = 2 / (signal + 1)
+
+    ema_f = sum(closes[:fast]) / fast
+    ema_s = sum(closes[:slow]) / slow
+
+    # Walk forward from slow-1 to build the MACD line
     macd_line = []
-    for i in range(slow - 1, len(closes)):
-        ef = calc_ema(closes[:i+1], fast)
-        es = calc_ema(closes[:i+1], slow)
-        if ef and es:
-            macd_line.append(ef - es)
+    for price in closes[slow:]:
+        ema_f = price * k_fast + ema_f * (1 - k_fast)
+        ema_s = price * k_slow + ema_s * (1 - k_slow)
+        macd_line.append(ema_f - ema_s)
+
     if len(macd_line) < signal:
         return None, None, None, None
+
+    # Seed signal EMA on first 'signal' MACD values
+    sig_ema = sum(macd_line[:signal]) / signal
+    for m in macd_line[signal:]:
+        sig_ema = m * k_sig + sig_ema * (1 - k_sig)
+
     macd_val   = round(macd_line[-1], 8)
-    signal_val = round(calc_ema(macd_line, signal) or 0, 8)
+    signal_val = round(sig_ema, 8)
     histogram  = round(macd_val - signal_val, 8)
-    # Bullish cross: MACD just crossed above signal
     is_bullish = macd_val > signal_val
     return macd_val, signal_val, histogram, is_bullish
 
@@ -554,7 +670,7 @@ def get_prices():
                     }
             except Exception:
                 pass
-            time.sleep(0.05)
+            time.sleep(0.02)   # 0.02s × 151 coins = 3s max fallback
         return result if result else None
     except Exception as e:
         print("Binance fallback error:", e)
@@ -606,7 +722,7 @@ def calc_levels(price, direction, rsi, vol_ratio, atr_pct=None):
     base = 0.025
     if vol_ratio and vol_ratio > 3:       base = 0.042
     elif vol_ratio and vol_ratio > 2:     base = 0.034
-    elif rsi and (rsi < 25 or rsi > 75):  base = 0.036
+    elif rsi is not None and (rsi < 25 or rsi > 75): base = 0.036
 
     if direction == "BUY":
         tp1 = round(price * (1 + base * 0.40), 8)
@@ -694,30 +810,27 @@ def build_signal(price, change, high, low, vol, ta):
     bb_bw        = (ta or {}).get("bb_bw")
     obv_trend    = (ta or {}).get("obv_trend")
 
-    # ── 4. ATR flat market filter (NEW) ──
+    # ── 4. ATR flat market filter ──
     # If market is sleeping (ATR too low) → skip entirely
     if atr_pct is not None and atr_pct < ATR_MIN_PCT:
-        print(f"    ATR flat market veto ({atr_pct:.3f}% < {ATR_MIN_PCT}%)")
         return None
 
     # ── 5. RSI hard veto ──
-    if score > 0 and rsi and rsi > 75:
-        print(f"    RSI veto BUY ({rsi:.1f} overbought)")
+    if score > 0 and rsi is not None and rsi > 75:
         return None
-    if score < 0 and rsi and rsi < 25:
-        print(f"    RSI veto SELL ({rsi:.1f} oversold)")
+    if score < 0 and rsi is not None and rsi < 25:
         return None
 
     # ── 6. RSI confirmation ──
-    if score > 0 and rsi:
+    if score > 0 and rsi is not None:
         if rsi < 40:   score += 2
         elif rsi < 50: score += 1
-    if score < 0 and rsi:
+    if score < 0 and rsi is not None:
         if rsi > 60:   score -= 2
         elif rsi > 50: score -= 1
 
     # ── 7. EMA trend ──
-    if ema20 and ema50:
+    if ema20 is not None and ema50 is not None:
         if score > 0 and ema20 > ema50: score += 1
         if score < 0 and ema20 < ema50: score -= 1
 
@@ -969,7 +1082,7 @@ def make_signal_msg(coin, sig, price, change):
     sig_id       = sig.get("sig_id", make_signal_id(coin["symbol"]))
 
     rsi_str  = f"{rsi:.1f}" if rsi is not None else "N/A"
-    ema_str  = ("↑ Uptrend" if ema20 > ema50 else "↓ Downtrend") if (ema20 and ema50) else "N/A"
+    ema_str  = ("↑ Uptrend" if ema20 > ema50 else "↓ Downtrend") if (ema20 is not None and ema50 is not None) else "N/A"
     vol_str  = f"{vol_ratio:.1f}x avg" if vol_ratio else "N/A"
     macd_str = ("✅ Bullish" if macd_bullish else "⚠️ Bearish") if macd_bullish is not None else "N/A"
     atr_str  = f"{atr_pct:.2f}%" if atr_pct else "N/A"
@@ -1129,6 +1242,7 @@ def paper_execute(coin, sig, price):
                 "opened_at":               time.time(),
                 "funding_periods_charged": 0,
                 "currentPnl":              0.0,
+                "unrealized_pnl":          0.0,   # FIX: initialised so /data never KeyErrors
                 "sig_id":                  sig_id,
             }
             bal_after  = paper_balance
@@ -1190,27 +1304,30 @@ def monitor_positions(prices):
         if not price:
             continue
 
-        direction  = pos["direction"]
-        entry      = pos["entry"]
-        exec_price = pos["exec_price"]
-        sl         = pos["sl"]
-        liq_price  = pos["liq_price"]
-        tp_hit     = pos["tp_hit"]
-        elapsed    = time.time() - pos["opened_at"]
-        tp_levels  = [pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"]]
-        trade_size = pos["margin"]
-
-        # ── Live unrealized PnL on remaining open position ──
-        remaining_pct = 1.0 - (tp_hit * 0.25)
-        if direction == "BUY":
-            live_move_pct = (price - exec_price) / exec_price * 100
-        else:
-            live_move_pct = (exec_price - price) / exec_price * 100
-        unrealized = round(trade_size * LEVERAGE * live_move_pct / 100 * remaining_pct, 2)
-        # Store on pos so /data endpoint serves fresh value
-        pos["unrealized_pnl"] = unrealized
-
         with state_lock:
+            # Read all pos fields inside lock — prevents race with /data endpoint
+            direction  = pos.get("direction", "BUY")
+            entry      = pos.get("entry", 0)
+            exec_price = pos.get("exec_price", 0)
+            sl         = pos.get("sl", 0)
+            liq_price  = pos.get("liq_price", 0)
+            tp_hit     = pos.get("tp_hit", 0)
+            elapsed    = time.time() - pos.get("opened_at", time.time())
+            tp_levels  = [pos.get("tp1",0), pos.get("tp2",0),
+                          pos.get("tp3",0), pos.get("tp4",0)]
+            trade_size = pos.get("margin", float(TRADE_SIZE))
+
+            # ── Live unrealized PnL — updated every monitor cycle ──
+            remaining_pct = 1.0 - (tp_hit * 0.25)
+            if exec_price > 0:
+                if direction == "BUY":
+                    live_move_pct = (price - exec_price) / exec_price * 100
+                else:
+                    live_move_pct = (exec_price - price) / exec_price * 100
+                pos["unrealized_pnl"] = round(
+                    trade_size * LEVERAGE * live_move_pct / 100 * remaining_pct, 2
+                )
+
             # ── Funding deduction every 8 hours ──
             funding_due = int(elapsed / 28800)
             new_periods = funding_due - pos.get("funding_periods_charged", 0)
@@ -1274,7 +1391,10 @@ def monitor_positions(prices):
                 stats["sl_hit"] += 1
                 # Count as won if SL closed in profit (breakeven or trailing above entry)
                 if is_profit or pos.get("first_tp_counted"):
-                    stats["trades_won"] += 1
+                    stats["trades_won"]          += 1
+                    risk_state["consec_losses"]   = 0   # reset on any win
+                else:
+                    risk_state["consec_losses"]  += 1   # track consecutive losses
                 stats["pnl_history"].append(round(paper_balance, 2))
                 stats["trades_list"].append({
                     "sym": sym, "direction": direction, "result": "SL",
@@ -1332,8 +1452,9 @@ def monitor_positions(prices):
                 pos["tp_hit"] = tp_num
 
                 if tp_num == 4:
-                    stats["total"]     += 1
-                    stats["trades_won"] += 1   # all 4 TPs = definite win
+                    stats["total"]              += 1
+                    stats["trades_won"]          += 1   # all 4 TPs = definite win
+                    risk_state["consec_losses"]   = 0   # reset streak
                     stats["trades_list"].append({
                         "sym": sym, "direction": direction, "result": "ALL_TP",
                         "pnl": round(pos["currentPnl"], 2), "time": utc_now_str(),
@@ -1382,11 +1503,15 @@ def monitor_positions(prices):
 
 # ─────────────────────────── MAIN ─────────────────────────────
 def run():
-    # FIX: declare both globals so pre_warned pruning updates the real global dict
-    global paper_balance, pre_warned
+    # FIX: declare all mutable globals so pruning updates the real objects
+    global paper_balance, pre_warned, last_signal
+
+    # Reset session start balance for daily loss tracking
+    risk_state["session_start_balance"] = paper_balance
+    risk_state["btc_last_check"]        = time.time()
 
     print("=" * 55)
-    print("  APEX Bybit Bot — PAPER TRADING MODE")
+    print("  APEX Bybit Bot v5 — PAPER TRADING MODE")
     print("=" * 55)
     sizing_note = f"dynamic ({RISK_PCT*100:.0f}% of balance)" if USE_DYNAMIC_SIZING else "fixed"
     print(f"Starting balance: ${PAPER_BALANCE} USDT (simulated)")
@@ -1400,26 +1525,26 @@ def run():
     print(f"Dashboard API running on port {os.environ.get('PORT', 8080)}")
 
     tg_send(
-        "<b>⚡ APEX Bybit Bot v4 — Online!</b>\n\n"
+        "<b>⚡ APEX Bybit Bot v5 — Online!</b>\n\n"
         f"Exchange: <b>Bybit Futures (SIMULATED)</b>\n"
         f"Leverage: <b>{LEVERAGE}x</b>\n"
         f"Sizing: <b>{sizing_note}</b>\n"
         f"Starting balance: <b>${PAPER_BALANCE} USDT</b>\n"
         f"Coins monitored: <b>{len(COINS)}</b>\n"
         f"Min confidence: <b>{MIN_CONF}%</b>\n\n"
-        f"<b>Signal Engine v4 — 7 Indicators:</b>\n"
+        f"<b>Signal Engine v5 — 7 Indicators:</b>\n"
         f"• RSI(14) — overbought/oversold filter\n"
         f"• EMA 20/50 — trend direction\n"
         f"• Volume ratio — spike detection\n"
-        f"• MACD — trend confirmation ✨NEW\n"
-        f"• ATR — dynamic SL + flat filter ✨NEW\n"
-        f"• Bollinger Bands — real breakouts ✨NEW\n"
-        f"• OBV — real vs fake volume ✨NEW\n\n"
-        f"<b>Improvements:</b>\n"
-        f"• ATR-based dynamic SL (smarter exits)\n"
-        f"• Flat market filter (no dead signals)\n"
-        f"• TP1/TP2 probability % shown\n"
-        f"• Fewer signals — much higher quality\n\n"
+        f"• MACD — trend confirmation\n"
+        f"• ATR — dynamic SL + flat filter\n"
+        f"• Bollinger Bands — real breakouts\n"
+        f"• OBV — real vs fake volume\n\n"
+        f"<b>🛡️ Risk Management:</b>\n"
+        f"• Daily loss limit: {MAX_DAILY_LOSS_PCT*100:.0f}%\n"
+        f"• Consecutive loss limit: {MAX_CONSEC_LOSSES} hits\n"
+        f"• Max trade age: {MAX_TRADE_HOURS}h (auto-close)\n"
+        f"• BTC crash guard: {BTC_CRASH_PCT:.0f}% in 1h\n\n"
         f"Blocked: {', '.join(BLOCKED_COINS) or 'None'}\n\n"
         f"<i>No real money at risk — pure data collection!</i>"
     )
@@ -1457,87 +1582,136 @@ def run():
                     f"(open: {open_count}, balance: ${balance:.2f})"
                 )
 
-                # FIX: prune stale pre-warns properly using global declaration above
+                # FIX: declare all mutable globals so pruning updates the real objects
                 now = time.time()
-                pre_warned = {k: v for k, v in pre_warned.items() if now - v < PRE_WARN_TTL}
+                pre_warned  = {k: v for k, v in pre_warned.items()  if now - v < PRE_WARN_TTL}
+                # Keep last_signal only for coins currently being watched (in COINS list)
+                coin_syms   = {c["symbol"] for c in COINS}
+                last_signal = {k: v for k, v in last_signal.items() if k in coin_syms}
+                # FIX: trim pnl_history in-place so RAM never grows unbounded
+                if len(stats["pnl_history"]) > 600:
+                    stats["pnl_history"] = stats["pnl_history"][-500:]
+
+                # ── Check for stale positions (open > MAX_TRADE_HOURS) ──
+                stale_syms = check_stale_positions()
+                for sym in stale_syms:
+                    stale_msg = None
+                    with state_lock:
+                        pos = positions.get(sym)
+                        if not pos:
+                            continue
+                        age_h     = (time.time() - pos.get("opened_at", time.time())) / 3600
+                        rem_pct   = 1.0 - (pos.get("tp_hit", 0) * 0.25)
+                        pnl_snap  = pos.get("currentPnl", 0)
+                        paper_balance += pos.get("margin", TRADE_SIZE) * rem_pct
+                        stats["total"]      += 1
+                        stats["trades_list"].append({
+                            "sym": sym, "direction": pos.get("direction",""),
+                            "result": "STALE_CLOSE",
+                            "pnl": round(pnl_snap, 2),
+                            "time": utc_now_str(),
+                        })
+                        positions.pop(sym, None)
+                        # Build message inside lock (reads balance), send outside
+                        stale_msg = (
+                            f"<b>⏰ STALE TRADE CLOSED — {sym}</b>\n\n"
+                            f"Position open for {age_h:.1f}h (max {MAX_TRADE_HOURS}h)\n"
+                            f"Realised P&L: +${pnl_snap:.2f} USDT\n\n"
+                            f"<i>Auto-closed to free capital.</i>"
+                        )
+                    # Send TG outside lock — no HTTP while holding state_lock
+                    if stale_msg:
+                        tg_send(stale_msg)
 
                 scan_prices = get_prices()
-                if scan_prices:
-                    prices = scan_prices
+                if not scan_prices:
+                    time.sleep(2)
+                    continue
 
-                    ta_candidates = []
-                    for coin in COINS:
-                        sym = coin["symbol"]
-                        if sym in BLOCKED_COINS:
+                prices = scan_prices
+
+                # ── Circuit breaker check ──
+                paused = check_circuit_breakers(scan_prices)
+                if paused:
+                    print(f"  🛑 Trading paused: {risk_state['pause_reason']}")
+                    time.sleep(2)
+                    continue
+
+                ta_candidates = []
+                for coin in COINS:
+                    sym = coin["symbol"]
+                    if sym in BLOCKED_COINS:
+                        continue
+                    with state_lock:
+                        if sym in positions:
                             continue
-                        with state_lock:
-                            if sym in positions:
-                                continue
-                        d      = scan_prices.get(coin["id"]) or {}
-                        change = d.get("usd_24h_change", 0) or 0
-                        if abs(change) >= 3:
-                            ta_candidates.append(sym)
+                    d      = scan_prices.get(coin["id"]) or {}
+                    change = d.get("usd_24h_change", 0) or 0
+                    if abs(change) >= 3:
+                        ta_candidates.append(sym)
 
-                    ta_map = fetch_ta_parallel(ta_candidates) if ta_candidates else {}
+                ta_map = fetch_ta_parallel(ta_candidates) if ta_candidates else {}
 
-                    for coin in COINS:
-                        sym = coin["symbol"]
-                        if sym in BLOCKED_COINS:
-                            continue
-                        with state_lock:
-                            if sym in positions:
-                                continue
-
-                        d      = scan_prices.get(coin["id"]) or {}
-                        price  = d.get("usd")
-                        change = d.get("usd_24h_change", 0) or 0
-                        high   = d.get("usd_24h_high")
-                        low    = d.get("usd_24h_low")
-                        vol    = d.get("usd_24h_vol")
-
-                        if not price or abs(change) < 2:
-                            continue
-
-                        print(f"  {sym}: ${price} {round(change, 2)}%", end="")
-
-                        ta = ta_map.get(sym)
-                        if ta:
-                            trend    = "↑" if ta.get("ema20") and ta.get("ema50") and ta["ema20"] > ta["ema50"] else "↓"
-                            macd_c   = "M✅" if ta.get("macd_bullish") else "M⚠️"
-                            bb_c     = "BB✅" if ta.get("bb_expanding") else "BB⚠️"
-                            obv_c    = "OBV✅" if ta.get("obv_trend") == "rising" else "OBV⚠️"
-                            atr_val  = ta.get("atr_pct")
-                            atr_c    = f"ATR={atr_val:.2f}%" if atr_val is not None else "ATR=N/A"
-                            print(f" | RSI={ta.get('rsi','?')} EMA={trend} {macd_c} {bb_c} {obv_c} {atr_c}", end="")
-
-                        sig = build_signal(price, change, high, low, vol, ta)
-                        print()
-
-                        if not sig or sig["conf"] < MIN_CONF:
-                            if sig and sig["conf"] >= MIN_CONF - 8 and sym not in pre_warned:
-                                pre_warned[sym] = time.time()
-                                tg_send(make_pre_warn(coin, sig["signal"], price))
-                                print(f"  ⚠️ Pre-warn: {sym}")
+                for coin in COINS:
+                    sym = coin["symbol"]
+                    if sym in BLOCKED_COINS:
+                        continue
+                    with state_lock:
+                        if sym in positions:
                             continue
 
-                        prev = last_signal.get(sym)
-                        if prev and prev["signal"] == sig["signal"] and \
-                                abs(prev.get("entry", 0) - price) / price < 0.005:
+                    d      = scan_prices.get(coin["id"]) or {}
+                    price  = d.get("usd")
+                    change = d.get("usd_24h_change", 0) or 0
+                    high   = d.get("usd_24h_high")
+                    low    = d.get("usd_24h_low")
+                    vol    = d.get("usd_24h_vol")
+
+                    if not price or abs(change) < 2:
+                        continue
+
+                    print(f"  {sym}: ${price} {round(change, 2)}%", end="")
+
+                    ta = ta_map.get(sym)
+                    if ta:
+                        trend    = "↑" if ta.get("ema20") and ta.get("ema50") and ta["ema20"] > ta["ema50"] else "↓"
+                        macd_c   = "M✅" if ta.get("macd_bullish") else "M⚠️"
+                        bb_c     = "BB✅" if ta.get("bb_expanding") else "BB⚠️"
+                        obv_c    = "OBV✅" if ta.get("obv_trend") == "rising" else "OBV⚠️"
+                        atr_val  = ta.get("atr_pct")
+                        atr_c    = f"ATR={atr_val:.2f}%" if atr_val is not None else "ATR=N/A"
+                        print(f" | RSI={ta.get('rsi','?')} EMA={trend} {macd_c} {bb_c} {obv_c} {atr_c}", end="")
+
+                    sig = build_signal(price, change, high, low, vol, ta)
+                    print()
+
+                    if not sig or sig["conf"] < MIN_CONF:
+                        if (sig and sig["conf"] >= MIN_CONF - 8
+                                and sym not in pre_warned
+                                and sym not in positions):
+                            pre_warned[sym] = time.time()
+                            tg_send(make_pre_warn(coin, sig["signal"], price))
+                            print(f"  ⚠️ Pre-warn: {sym}")
+                        continue
+
+                    prev = last_signal.get(sym)
+                    if prev and prev["signal"] == sig["signal"] and \
+                            abs(prev.get("entry", 0) - price) / price < 0.005:
+                        continue
+
+                    with state_lock:
+                        if len(positions) >= MAX_OPEN_TRADES:
+                            print(f"  Max trades reached, skipping {sym}")
                             continue
+                        pre_warned.pop(sym, None)
 
-                        with state_lock:
-                            if len(positions) >= MAX_OPEN_TRADES:
-                                print(f"  Max trades reached, skipping {sym}")
-                                continue
-                            pre_warned.pop(sym, None)
+                    sig["entry"]     = price
+                    sig["sig_id"]    = make_signal_id(sym)
+                    last_signal[sym] = sig
 
-                        sig["entry"]     = price
-                        sig["sig_id"]    = make_signal_id(sym)
-                        last_signal[sym] = sig
-
-                        tg_send(make_signal_msg(coin, sig, price, change))
-                        paper_execute(coin, sig, price)
-                        print(f"  🚀 Paper signal: {sym} {sig['signal']} {sig['conf']}%")
+                    tg_send(make_signal_msg(coin, sig, price, change))
+                    paper_execute(coin, sig, price)
+                    print(f"  🚀 Paper signal: {sym} {sig['signal']} {sig['conf']}%")
 
             time.sleep(2)
 
