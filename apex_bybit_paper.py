@@ -33,17 +33,17 @@ BYBIT_SECRET = os.environ.get("BYBIT_SECRET", "").strip()
 TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-TRADE_SIZE         = 150.0     # $150 margin per trade (7.5% of balance)
-USE_DYNAMIC_SIZING = False     # Fixed $150 always
-RISK_PCT           = 0.075     # Unused — dynamic sizing off
-MIN_TRADE_SIZE     = 150.0
-MAX_TRADE_SIZE     = 150.0
+TRADE_SIZE         = 200.0     # $200 margin per trade (10% of balance)
+USE_DYNAMIC_SIZING = False     # Fixed $200 always
+RISK_PCT           = 0.10      # Unused — dynamic sizing off
+MIN_TRADE_SIZE     = 200.0
+MAX_TRADE_SIZE     = 200.0
 
-LEVERAGE           = 5         # 5x → $750 exposure per trade
-MIN_CONF           = 85
+LEVERAGE           = 5         # 5x → $1,000 exposure per trade ($200 × 5)
+MIN_CONF           = 85        # 85% minimum — proven quality threshold
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
-MAX_OPEN_TRADES    = 8         # 8 × $150 = $1,200 deployed ($800 reserve)
+MAX_OPEN_TRADES    = 8         # 8 × $200 = $1,600 deployed ($400 reserve)
 
 SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
@@ -345,7 +345,8 @@ def check_circuit_breakers(scan_prices=None):
             tg_send(
                 f"<b>⚠️ CONSECUTIVE LOSS LIMIT — Pausing 1 hour</b>\n\n"
                 f"Reason: {reason}\n"
-                f"Balance: ${balance:.2f} USDT\n\n"
+                f"Free cash: ${free_cash:.2f} USDT\n"
+                f"Total capital: ${total_capital:.2f} USDT\n\n"
                 f"<i>Taking a break. Will auto-resume after 60 minutes.</i>"
             )
         return True
@@ -366,7 +367,9 @@ def check_circuit_breakers(scan_prices=None):
                         risk_state["pause_reason"]   = reason
                         tg_send(
                             f"<b>🚨 BTC CRASH DETECTED — Pausing signals</b>\n\n"
-                            f"BTC: ${btc_prev:.0f} → ${btc_now:.0f} ({btc_change:.1f}%)\n\n"
+                            f"BTC: ${btc_prev:.0f} → ${btc_now:.0f} ({btc_change:.1f}%)\n"
+                            f"Free cash: ${free_cash:.2f} USDT\n"
+                            f"Total capital: ${total_capital:.2f} USDT\n\n"
                             f"<i>Halting new signals until market stabilises.</i>"
                         )
                     return True
@@ -1031,11 +1034,89 @@ def tg_updates(offset=None):
         return None
 
 
+def make_report():
+    """Generate a full session report on demand."""
+    with state_lock:
+        total      = stats["total"]
+        trades_won = stats["trades_won"]
+        win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
+        net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
+        net_sign   = "+" if net_pnl >= 0 else ""
+        free_cash  = paper_balance
+        deployed   = sum(pos.get("margin", 0) * (1.0 - pos.get("tp_hit", 0) * 0.25)
+                         for pos in positions.values())
+        total_cap  = round(free_cash + deployed, 2)
+        open_count = len(positions)
+
+        # Build open positions summary
+        pos_lines = []
+        for sym, pos in positions.items():
+            direction  = pos.get("direction", "")
+            tp_hit     = pos.get("tp_hit", 0)
+            realized   = round(pos.get("currentPnl", 0), 2)
+            unrealized = round(pos.get("unrealized_pnl", 0), 2)
+            arrow      = "🟢" if direction == "BUY" else "🔴"
+            be_flag    = "🔒" if pos.get("breakeven") else ""
+            progress   = tp_progress_bar(tp_hit, direction)
+            pos_lines.append(
+                f"{arrow} {sym} {be_flag}  {progress}\n"
+                f"   R:+${realized:.2f}  U:${unrealized:+.2f}"
+            )
+
+        paused_str = f"\n⚠️ Paused: {risk_state['pause_reason']}" \
+                     if risk_state.get("trading_paused") else ""
+
+    pos_block = "\n".join(pos_lines) if pos_lines else "None"
+    start_bal = risk_state["session_start_balance"]
+    drawdown  = round((total_cap - start_bal) / start_bal * 100, 1)
+    dd_icon   = "📈" if drawdown >= 0 else "📉"
+
+    return (
+        f"<b>📊 APEX REPORT — {utc_now_str()}</b>\n"
+        f"══════════════════════════════\n"
+        f"💰 Free cash:     ${free_cash:.2f} USDT\n"
+        f"📦 Deployed:      ${deployed:.2f} USDT ({open_count} trades)\n"
+        f"💎 Total capital: ${total_cap:.2f} USDT\n"
+        f"{dd_icon} vs start:       {drawdown:+.1f}%\n\n"
+        f"📈 Session P&L:   {net_sign}${abs(net_pnl):.2f} USDT\n"
+        f"🏆 Win rate:      {trades_won}/{total} = {win_rate}%\n"
+        f"✅ TP hits:       {stats['tp_hit']}\n"
+        f"❌ SL hits:       {stats['sl_hit']}\n"
+        f"{paused_str}\n\n"
+        f"<b>Open positions ({open_count}):</b>\n"
+        f"{pos_block}"
+    )
+
+
 def check_btns(offset):
     updates = tg_updates(offset)
     if updates and updates.get("ok"):
         for u in updates.get("result", []):
             offset = u["update_id"] + 1
+            # Handle text commands from user
+            msg  = (u.get("message") or u.get("channel_post") or {})
+            text = msg.get("text", "").strip().lower()
+            if text in ("/report", "/status", "/r"):
+                tg_send(make_report())
+            elif text == "/pause":
+                risk_state["trading_paused"] = True
+                risk_state["pause_reason"]   = "Manual pause via /pause"
+                tg_send("<b>⏸ Trading manually paused.</b>\nSend /resume to restart.")
+            elif text == "/resume":
+                risk_state["trading_paused"] = False
+                risk_state["pause_reason"]   = ""
+                risk_state["consec_losses"]  = 0
+                tg_send("<b>▶️ Trading resumed.</b>")
+            elif text == "/help":
+                tg_send(
+                    "<b>⚡ APEX Commands</b>\n\n"
+                    "/report — Full session report\n"
+                    "/status — Same as /report\n"
+                    "/r      — Quick shortcut\n"
+                    "/pause  — Pause new signals\n"
+                    "/resume — Resume trading\n"
+                    "/help   — This message"
+                )
     return offset
 
 
@@ -1532,14 +1613,15 @@ def run():
     print(f"Dashboard API running on port {os.environ.get('PORT', 8080)}")
 
     tg_send(
-        "<b>⚡ APEX Bybit Bot v5 — Online!</b>\n\n"
+        "<b>⚡ APEX Bybit Bot v6 — Online!</b>\n\n"
         f"Exchange: <b>Bybit Futures (SIMULATED)</b>\n"
         f"Leverage: <b>{LEVERAGE}x</b>\n"
-        f"Sizing: <b>{sizing_note}</b>\n"
+        f"Trade size: <b>${TRADE_SIZE:.0f} USDT</b>\n"
+        f"Exposure/trade: <b>${TRADE_SIZE*LEVERAGE:.0f} USDT</b>\n"
         f"Starting balance: <b>${PAPER_BALANCE} USDT</b>\n"
         f"Coins monitored: <b>{len(COINS)}</b>\n"
         f"Min confidence: <b>{MIN_CONF}%</b>\n\n"
-        f"<b>Signal Engine v5 — 7 Indicators:</b>\n"
+        f"<b>Signal Engine v6 — 7 Indicators:</b>\n"
         f"• RSI(14) — overbought/oversold filter\n"
         f"• EMA 20/50 — trend direction\n"
         f"• Volume ratio — spike detection\n"
@@ -1552,6 +1634,7 @@ def run():
         f"• Consecutive loss limit: {MAX_CONSEC_LOSSES} hits\n"
         f"• Max trade age: {MAX_TRADE_HOURS}h (auto-close)\n"
         f"• BTC crash guard: {BTC_CRASH_PCT:.0f}% in 1h\n\n"
+        f"<b>📊 Commands:</b> /report /pause /resume /help\n\n"
         f"Blocked: {', '.join(BLOCKED_COINS) or 'None'}\n\n"
         f"<i>No real money at risk — pure data collection!</i>"
     )
