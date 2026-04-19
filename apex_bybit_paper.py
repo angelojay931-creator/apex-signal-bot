@@ -49,7 +49,24 @@ SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
 PRE_WARN_TTL       = 7200
 
-BLOCKED_COINS = {"ENJ"}
+BLOCKED_COINS = {
+    "ENJ",    # delisted/low liquidity
+    "WAVES",  # liquidated us — extreme pump/dump risk
+    "ONT",    # very low liquidity
+    "LUNA",   # high volatility, unreliable signals
+    "REEF",   # micro cap — gap risk
+    "LOKA",   # micro cap — gap risk
+    "AUCTION",# low volume
+    "NULS",   # low volume
+    "ALPHA",  # low volume
+    "CLV",    # low volume
+    "SXP",    # low volume
+    "FIS",    # low volume
+    "MDT",    # low volume
+    "WRX",    # extreme volatility
+    "DODO",   # low volume
+    "BLZ",    # low volume
+}
 
 # ─────────────── PROFESSIONAL RISK MANAGEMENT ─────────────────
 # Circuit breakers — protect capital when things go wrong
@@ -87,6 +104,8 @@ risk_state = {
     "pause_reason":          "",             # why trading is paused
     "btc_last_price":        None,           # for BTC crash detection
     "btc_last_check":        0.0,            # timestamp of last BTC check
+    "pause_until":           0.0,            # auto-resume timestamp (0 = manual only)
+    "daily_reset_at":        0.0,            # timestamp of last daily loss reset
 }
 
 # ─────────────────────────── COINS ────────────────────────────
@@ -301,57 +320,93 @@ def calc_trade_size():
 def check_circuit_breakers(scan_prices=None):
     """
     Professional circuit breakers — pause trading when:
-    1. Daily drawdown > MAX_DAILY_LOSS_PCT (8%)
-    2. Consecutive SL losses >= MAX_CONSEC_LOSSES (3)
-    3. BTC drops > BTC_CRASH_PCT (-5%) in last hour
+    1. Daily drawdown > MAX_DAILY_LOSS_PCT (8%) — resets at midnight UTC
+    2. Consecutive SL losses >= MAX_CONSEC_LOSSES (3) — auto-resumes after 1h
+    3. BTC drops > BTC_CRASH_PCT (-5%) in last hour — auto-resumes after 2h
     Returns True if trading should be paused.
     """
     global risk_state
 
     with state_lock:
-        free_cash      = paper_balance
-        # Total capital = free cash + all margin currently deployed in open positions
-        # This prevents deployed margin being mistaken for losses
+        free_cash       = paper_balance
         deployed_margin = sum(pos.get("margin", 0) * (1.0 - pos.get("tp_hit", 0) * 0.25)
                               for pos in positions.values())
-        total_capital  = free_cash + deployed_margin
+        total_capital   = free_cash + deployed_margin
 
+    now       = time.time()
     start_bal = risk_state["session_start_balance"]
 
+    # ── Auto-resume check — runs before all triggers ──
+    # If a timed pause has expired, clear it regardless of which trigger set it
+    if risk_state["trading_paused"] and risk_state["pause_until"] > 0:
+        if now >= risk_state["pause_until"]:
+            risk_state["trading_paused"] = False
+            risk_state["pause_reason"]   = ""
+            risk_state["consec_losses"]  = 0
+            risk_state["pause_until"]    = 0.0
+            tg_send(
+                f"<b>✅ Auto-Resume — Trading Restarted</b>\n\n"
+                f"Pause period expired.\n"
+                f"Free cash: ${free_cash:.2f} USDT\n"
+                f"Total capital: ${total_capital:.2f} USDT"
+            )
+
+    # ── Daily reset at midnight UTC ──
+    # Reset session_start_balance each new UTC day so daily loss tracks correctly
+    midnight_today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp()
+    if risk_state["daily_reset_at"] < midnight_today:
+        risk_state["daily_reset_at"]        = midnight_today
+        risk_state["session_start_balance"] = total_capital
+        start_bal                           = total_capital
+        # If paused for daily loss, clear it on new day
+        if risk_state["trading_paused"] and "daily loss" in risk_state["pause_reason"].lower():
+            risk_state["trading_paused"] = False
+            risk_state["pause_reason"]   = ""
+            risk_state["consec_losses"]  = 0
+            risk_state["pause_until"]    = 0.0
+            tg_send(
+                f"<b>🌅 New Day — Daily Loss Limit Reset</b>\n\n"
+                f"Session balance reset to ${total_capital:.2f} USDT\n"
+                f"Trading resumed for new UTC day."
+            )
+
     # ── 1. Daily loss limit ──
-    # Use total capital (free + deployed) so open positions don't trigger false alarms
     drawdown_pct = (total_capital - start_bal) / start_bal * 100
     if drawdown_pct <= -(MAX_DAILY_LOSS_PCT * 100):
         if not risk_state["trading_paused"]:
             reason = f"Daily loss limit hit ({drawdown_pct:.1f}% drawdown)"
             risk_state["trading_paused"] = True
             risk_state["pause_reason"]   = reason
+            risk_state["pause_until"]    = 0.0   # manual resume or midnight reset
             tg_send(
                 f"<b>🛑 CIRCUIT BREAKER — Trading Paused</b>\n\n"
                 f"Reason: {reason}\n"
                 f"Free cash: ${free_cash:.2f} USDT\n"
                 f"Total capital: ${total_capital:.2f} USDT\n"
                 f"Started: ${start_bal:.2f} USDT\n\n"
-                f"<i>Bot will resume scanning but not open new trades.</i>"
+                f"<i>Will auto-resume at midnight UTC or type /resume.</i>"
             )
         return True
 
-    # ── 2. Consecutive losses ──
+    # ── 2. Consecutive losses — auto-resume after 1 hour ──
     if risk_state["consec_losses"] >= MAX_CONSEC_LOSSES:
         if not risk_state["trading_paused"]:
             reason = f"{MAX_CONSEC_LOSSES} consecutive SL hits"
             risk_state["trading_paused"] = True
             risk_state["pause_reason"]   = reason
+            risk_state["pause_until"]    = now + 3600   # 1 hour
+            resume_time = datetime.fromtimestamp(now + 3600, tz=timezone.utc).strftime("%H:%M UTC")
             tg_send(
                 f"<b>⚠️ CONSECUTIVE LOSS LIMIT — Pausing 1 hour</b>\n\n"
                 f"Reason: {reason}\n"
                 f"Free cash: ${free_cash:.2f} USDT\n"
                 f"Total capital: ${total_capital:.2f} USDT\n\n"
-                f"<i>Taking a break. Will auto-resume after 60 minutes.</i>"
+                f"<i>Auto-resuming at {resume_time}.</i>"
             )
         return True
 
-    # ── 3. BTC crash guard ──
+    # ── 3. BTC crash guard — auto-resume after 2 hours ──
     if scan_prices and time.time() - risk_state["btc_last_check"] >= 3600:
         btc_now  = (scan_prices.get("bitcoin") or {}).get("usd")
         btc_prev = risk_state["btc_last_price"]
@@ -365,21 +420,26 @@ def check_circuit_breakers(scan_prices=None):
                         reason = f"BTC crashed {btc_change:.1f}% in 1h"
                         risk_state["trading_paused"] = True
                         risk_state["pause_reason"]   = reason
+                        risk_state["pause_until"]    = now + 7200   # 2 hours
+                        resume_time = datetime.fromtimestamp(now + 7200, tz=timezone.utc).strftime("%H:%M UTC")
                         tg_send(
                             f"<b>🚨 BTC CRASH DETECTED — Pausing signals</b>\n\n"
                             f"BTC: ${btc_prev:.0f} → ${btc_now:.0f} ({btc_change:.1f}%)\n"
                             f"Free cash: ${free_cash:.2f} USDT\n"
                             f"Total capital: ${total_capital:.2f} USDT\n\n"
-                            f"<i>Halting new signals until market stabilises.</i>"
+                            f"<i>Auto-resuming at {resume_time}.</i>"
                         )
                     return True
 
-    # ── Resume if all clear ──
-    if risk_state["trading_paused"]:
+    # ── Resume if all conditions clear ──
+    if risk_state["trading_paused"] and risk_state["pause_until"] == 0.0:
         risk_state["trading_paused"] = False
         risk_state["pause_reason"]   = ""
         risk_state["consec_losses"]  = 0
-        tg_send("<b>✅ Circuit Breaker Reset — Trading Resumed</b>")
+        tg_send(
+            f"<b>✅ Circuit Breaker Reset — Trading Resumed</b>\n\n"
+            f"Total capital: ${total_capital:.2f} USDT"
+        )
 
     return False
 
@@ -1041,7 +1101,7 @@ def make_report():
         trades_won = stats["trades_won"]
         win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
         net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-        net_sign   = "+" if net_pnl >= 0 else ""
+        net_sign   = "+" if net_pnl >= 0 else "-"
         free_cash  = paper_balance
         deployed   = sum(pos.get("margin", 0) * (1.0 - pos.get("tp_hit", 0) * 0.25)
                          for pos in positions.values())
@@ -1221,7 +1281,7 @@ def make_tp_msg(sym, direction, tp_num, entry, exec_price, tp_price, elapsed, pn
         trades_won = stats["trades_won"]
         win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
         net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-        net_sign   = "+" if net_pnl >= 0 else ""
+        net_sign   = "+" if net_pnl >= 0 else "-"
         balance    = paper_balance
 
     entry_note  = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
@@ -1255,7 +1315,7 @@ def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, 
         trades_won = stats["trades_won"]
         win_rate   = round(trades_won / total * 100, 1) if total > 0 else 0
         net_pnl    = round(stats["profit_usdt"] - stats["loss_usdt"], 2)
-        net_sign   = "+" if net_pnl >= 0 else ""
+        net_sign   = "+" if net_pnl >= 0 else "-"
         balance    = paper_balance
 
     entry_note   = f" (exec {fmt_p(exec_price)})" if abs(exec_price - entry) / entry > 0.0005 else ""
