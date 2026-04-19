@@ -1613,7 +1613,7 @@ def run():
     print(f"Dashboard API running on port {os.environ.get('PORT', 8080)}")
 
     tg_send(
-        "<b>⚡ APEX Bybit Bot v6 — Online!</b>\n\n"
+        "<b>⚡ APEX Bybit Bot v5 — Online!</b>\n\n"
         f"Exchange: <b>Bybit Futures (SIMULATED)</b>\n"
         f"Leverage: <b>{LEVERAGE}x</b>\n"
         f"Trade size: <b>${TRADE_SIZE:.0f} USDT</b>\n"
@@ -1621,7 +1621,7 @@ def run():
         f"Starting balance: <b>${PAPER_BALANCE} USDT</b>\n"
         f"Coins monitored: <b>{len(COINS)}</b>\n"
         f"Min confidence: <b>{MIN_CONF}%</b>\n\n"
-        f"<b>Signal Engine v6 — 7 Indicators:</b>\n"
+        f"<b>Signal Engine v5 — 7 Indicators:</b>\n"
         f"• RSI(14) — overbought/oversold filter\n"
         f"• EMA 20/50 — trend direction\n"
         f"• Volume ratio — spike detection\n"
