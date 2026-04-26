@@ -33,47 +33,45 @@ BYBIT_SECRET = os.environ.get("BYBIT_SECRET", "").strip()
 TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-TRADE_SIZE         = 200.0     # $200 margin per trade (10% of balance)
-USE_DYNAMIC_SIZING = False     # Fixed $200 always
-RISK_PCT           = 0.10      # Unused — dynamic sizing off
-MIN_TRADE_SIZE     = 200.0
-MAX_TRADE_SIZE     = 200.0
+TRADE_SIZE         = 100.0     # $100 margin — Phase 1 safe sizing
+USE_DYNAMIC_SIZING = False     # Fixed $100 always
+RISK_PCT           = 0.05      # Unused — dynamic sizing off
+MIN_TRADE_SIZE     = 100.0
+MAX_TRADE_SIZE     = 100.0
 
-LEVERAGE           = 5         # 5x → $1,000 exposure per trade ($200 × 5)
+LEVERAGE           = 5         # 5x → $500 exposure per trade ($100 × 5)
 MIN_CONF           = 85        # 85% minimum — proven quality threshold
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
-MAX_OPEN_TRADES    = 8         # 8 × $200 = $1,600 deployed ($400 reserve)
+MAX_OPEN_TRADES    = 3         # Phase 1: max 3 open — 40% free cash minimum
 
 SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
 PRE_WARN_TTL       = 7200
+GAP_SLIPPAGE_PCT   = 0.005    # Phase 1: gap fill slippage when price skips SL
+LIQ_BUFFER_PCT     = 0.02     # Phase 1: SL must be at least 2% before liq price
+MIN_24H_VOLUME     = 500_000_000  # Phase 1: skip coins with <$500M 24h volume
 
 BLOCKED_COINS = {
-    "ENJ",    # delisted/low liquidity
-    "WAVES",  # liquidated us — extreme pump/dump risk
-    "ONT",    # very low liquidity
-    "LUNA",   # high volatility, unreliable signals
-    "REEF",   # micro cap — gap risk
-    "LOKA",   # micro cap — gap risk
-    "AUCTION",# low volume
-    "NULS",   # low volume
-    "ALPHA",  # low volume
-    "CLV",    # low volume
-    "SXP",    # low volume
-    "FIS",    # low volume
-    "MDT",    # low volume
-    "WRX",    # extreme volatility
-    "DODO",   # low volume
-    "BLZ",    # low volume
+    # Liquidated us — extreme gap risk
+    "WAVES", "HNT", "EOS", "ALPACA",
+    # Extreme volatility / low liquidity
+    "WRX", "REEF", "LOKA", "AUCTION", "NULS", "ALPHA",
+    "CLV", "SXP", "FIS", "MDT", "DODO", "BLZ",
+    # Low quality — from data analysis
+    "APT", "CHZ", "MANA", "SUI", "WOO", "SAND",
+    # Legacy block
+    "ENJ",
 }
 
 # ─────────────── PROFESSIONAL RISK MANAGEMENT ─────────────────
 # Circuit breakers — protect capital when things go wrong
-MAX_DAILY_LOSS_PCT  = 0.08   # Stop new signals if down >8% in a day
+MAX_DAILY_LOSS_PCT  = 0.05   # Phase 1: tighter — pause if down >5% in a day
 MAX_CONSEC_LOSSES   = 3      # Pause after 3 consecutive SL hits
 MAX_TRADE_HOURS     = 48     # Force-close positions open > 48 hours
 BTC_CRASH_PCT       = -5.0   # Pause new signals if BTC drops >5% in 1h
+MAX_SAME_DIRECTION  = 2      # Phase 1: max 2 SHORTs + 2 LONGs at any time
+MIN_FREE_CASH_PCT   = 0.40   # Phase 1: always keep 40% free cash
 
 # ─────────────────────────── STATE ────────────────────────────
 # RLock: reentrant — make_tp_msg/make_sl_msg re-acquire inside monitor_positions
@@ -885,6 +883,13 @@ def build_signal(price, change, high, low, vol, ta):
     if atr_pct is not None and atr_pct < ATR_MIN_PCT:
         return None
 
+    # ── 4b. ATR extreme volatility filter (Phase 1) ──
+    # Block coins with ATR > 8% — too volatile, SL gaps to liquidation
+    # WAVES=26%, HNT=17%, EOS=17% all liquidated us — this stops it
+    ATR_MAX_PCT = 8.0
+    if atr_pct is not None and atr_pct > ATR_MAX_PCT:
+        return None
+
     # ── 5. RSI hard veto ──
     if score > 0 and rsi is not None and rsi > 75:
         return None
@@ -1342,6 +1347,37 @@ def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, 
 
 
 # ──────────────────────── PAPER EXECUTE ───────────────────────
+# ─────────────────── PHASE 1 HELPER FUNCTIONS ────────────────
+def is_sl_hit(direction, price, sl):
+    """Returns True if current price has reached the stop-loss."""
+    if direction == "BUY":
+        return price <= sl
+    return price >= sl
+
+
+def is_liq_hit(direction, price, liq_price):
+    """Returns True if current price has reached the liquidation price."""
+    if direction == "BUY":
+        return price <= liq_price
+    return price >= liq_price
+
+
+def is_sl_safe(direction, sl, liq_price):
+    """
+    Returns True if SL is safely before the liquidation price.
+    Requires LIQ_BUFFER_PCT (2%) gap between SL and liquidation.
+    Prevents trades where SL is so close to liq that any gap causes liquidation.
+    """
+    if liq_price <= 0 or sl <= 0:
+        return False
+    if direction == "BUY":
+        # SL must be at least LIQ_BUFFER_PCT above liq price
+        return sl >= liq_price * (1 + LIQ_BUFFER_PCT)
+    else:
+        # SL must be at least LIQ_BUFFER_PCT below liq price
+        return sl <= liq_price * (1 - LIQ_BUFFER_PCT)
+
+
 def paper_execute(coin, sig, price):
     """Simulate opening a leveraged position instantly."""
     global paper_balance
@@ -1362,8 +1398,33 @@ def paper_execute(coin, sig, price):
     else:
         liq_price = round(exec_price * (1 + 0.9 / LEVERAGE), 8)
 
+    # ── Phase 1: Reject if SL is not safely before liquidation ──
+    if not is_sl_safe(direction, sig["sl"], liq_price):
+        print(f"  ⛔ SL unsafe — SL={sig['sl']:.6f} Liq={liq_price:.6f} — rejected")
+        return False
+
     # All state mutations under lock; TG calls outside to avoid holding lock during HTTP
     with state_lock:
+        # ── Hard cap — safety net in case scan loop check is bypassed ──
+        if len(positions) >= MAX_OPEN_TRADES:
+            print(f"  ⛔ Max trades reached inside execute: {len(positions)}/{MAX_OPEN_TRADES}")
+            return False
+
+        # ── Phase 1: Direction correlation cap ──
+        same_dir = sum(1 for p in positions.values() if p.get("direction") == direction)
+        if same_dir >= MAX_SAME_DIRECTION:
+            print(f"  ⛔ Direction cap: already {same_dir} {direction}s open (max {MAX_SAME_DIRECTION})")
+            return False
+
+        # ── Phase 1: Minimum free cash check (40%) ──
+        total_cap = paper_balance + sum(
+            p.get("margin", 0) * (1 - p.get("tp_hit", 0) * 0.25)
+            for p in positions.values())
+        free_pct = (paper_balance - trade_size) / total_cap if total_cap > 0 else 0
+        if free_pct < MIN_FREE_CASH_PCT:
+            print(f"  ⛔ Free cash too low: {free_pct*100:.1f}% < {MIN_FREE_CASH_PCT*100:.0f}% required")
+            return False
+
         if paper_balance < trade_size:
             bal_snap = paper_balance
         else:
@@ -1390,8 +1451,9 @@ def paper_execute(coin, sig, price):
                 "opened_at":               time.time(),
                 "funding_periods_charged": 0,
                 "currentPnl":              0.0,
-                "unrealized_pnl":          0.0,   # FIX: initialised so /data never KeyErrors
+                "unrealized_pnl":          0.0,
                 "sig_id":                  sig_id,
+                "close_reason":            None,  # Phase 1: track close reason
             }
             bal_after  = paper_balance
             open_count = len(positions)
@@ -1487,40 +1549,8 @@ def monitor_positions(prices):
                 stats["pnl_history"].append(round(paper_balance, 2))
                 print(f"  💸 Funding: {sym} -${funding_cost:.4f} ({new_periods} period(s))")
 
-            # ── Liquidation check ──
-            liq_hit = (direction == "BUY"  and price <= liq_price) or \
-                      (direction == "SELL" and price >= liq_price)
-
-            if liq_hit:
-                rem_pct          = 1.0 - (tp_hit * 0.25)
-                remaining_margin = trade_size * rem_pct
-                stats["loss_usdt"] += remaining_margin
-                stats["total"]     += 1
-                stats["sl_hit"]    += 1
-                stats["pnl_history"].append(round(paper_balance, 2))
-                stats["trades_list"].append({
-                    "sym": sym, "direction": direction,
-                    "result": "LIQUIDATED", "pnl": -remaining_margin,
-                    "time": utc_now_str(),
-                })
-                notifications.append(
-                    f"<b>💀 LIQUIDATED — {sym}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 #{pos.get('sig_id', '?')}  |  Entry: {fmt_p(entry)}\n"
-                    f"{tp_progress_bar(tp_hit, direction)}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Price hit liquidation at {fmt_p(liq_price)}\n"
-                    f"Margin lost: ${remaining_margin:.2f} USDT\n\n"
-                    f"Balance: ${paper_balance:.2f} USDT"
-                )
-                to_remove.append(sym)
-                continue
-
-            # ── SL check ──
-            sl_hit = (direction == "BUY"  and price <= sl) or \
-                     (direction == "SELL" and price >= sl)
-
-            if sl_hit:
+            # ── SL check FIRST (always before liquidation per Phase 1) ──
+            if is_sl_hit(direction, price, sl):
                 rem_pct          = 1.0 - (tp_hit * 0.25)
                 price_move       = abs(sl - exec_price) / exec_price * 100
                 is_profit        = (direction == "BUY"  and sl >= exec_price) or \
@@ -1537,25 +1567,61 @@ def monitor_positions(prices):
 
                 stats["total"]  += 1
                 stats["sl_hit"] += 1
-                # Count as won if SL closed in profit (breakeven or trailing above entry)
                 if is_profit or pos.get("first_tp_counted"):
-                    stats["trades_won"]          += 1
-                    risk_state["consec_losses"]   = 0   # reset on any win
+                    stats["trades_won"]         += 1
+                    risk_state["consec_losses"]  = 0
                 else:
-                    risk_state["consec_losses"]  += 1   # track consecutive losses
+                    risk_state["consec_losses"] += 1
                 stats["pnl_history"].append(round(paper_balance, 2))
                 stats["trades_list"].append({
-                    "sym": sym, "direction": direction, "result": "SL",
+                    "sym": sym, "direction": direction,
+                    "result": "SL", "close_reason": "SL",
                     "pnl": pnl_usdt if is_profit else -pnl_usdt,
                     "time": utc_now_str(),
                 })
-                # Build message inside lock (reads stats), send outside
                 notifications.append(
                     make_sl_msg(sym, direction, entry, exec_price, sl,
                                 elapsed, pnl_usdt, pos.get("breakeven"),
                                 sig_id=pos.get("sig_id"), tp_hit_total=tp_hit,
                                 trade_pnl_so_far=pos.get("currentPnl", 0))
                 )
+                to_remove.append(sym)
+                continue
+
+            # ── Liquidation check SECOND ──
+            # SL was NOT hit above, so if liq is hit the price gapped
+            # straight through SL → treat as GAP_SL, fill at SL + GAP_SLIPPAGE_PCT
+            if is_liq_hit(direction, price, liq_price):
+                rem_pct          = 1.0 - (tp_hit * 0.25)
+                remaining_margin = trade_size * rem_pct
+                if direction == "BUY":
+                    gap_close_price = sl * (1 - GAP_SLIPPAGE_PCT)
+                else:
+                    gap_close_price = sl * (1 + GAP_SLIPPAGE_PCT)
+                price_move  = abs(gap_close_price - exec_price) / exec_price * 100
+                pnl_usdt    = round(trade_size * LEVERAGE * price_move / 100 * rem_pct, 2)
+                stats["loss_usdt"] += pnl_usdt
+                paper_balance      += max(0, remaining_margin - pnl_usdt)
+                stats["total"]     += 1
+                stats["sl_hit"]    += 1
+                risk_state["consec_losses"] += 1
+                stats["pnl_history"].append(round(paper_balance, 2))
+                stats["trades_list"].append({
+                    "sym": sym, "direction": direction,
+                    "result": "GAP_SL", "close_reason": "GAP_SL",
+                    "pnl": -pnl_usdt, "time": utc_now_str(),
+                })
+                notifications.append(
+                    f"<b>⚠️ GAP SL — {sym}</b> (price gapped past SL to liq)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 #{pos.get('sig_id','?')}  |  Entry: {fmt_p(entry)}\n"
+                    f"{tp_progress_bar(tp_hit, direction)}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"SL: {fmt_p(sl)}  →  Gap fill: {fmt_p(gap_close_price)}\n"
+                    f"Loss: -${pnl_usdt:.2f} USDT (capped at SL, NOT full liq)\n\n"
+                    f"Balance: ${paper_balance:.2f} USDT"
+                )
+                print(f"  ⚠️ GAP SL: {sym} — skipped SL {sl:.5f}, hit liq {liq_price:.5f}")
                 to_remove.append(sym)
                 continue
 
@@ -1673,30 +1739,22 @@ def run():
     print(f"Dashboard API running on port {os.environ.get('PORT', 8080)}")
 
     tg_send(
-        "<b>⚡ APEX Bybit Bot v5 — Online!</b>\n\n"
+        "<b>⚡ APEX — PHASE 1 REBUILD</b>\n\n"
         f"Exchange: <b>Bybit Futures (SIMULATED)</b>\n"
-        f"Leverage: <b>{LEVERAGE}x</b>\n"
-        f"Trade size: <b>${TRADE_SIZE:.0f} USDT</b>\n"
-        f"Exposure/trade: <b>${TRADE_SIZE*LEVERAGE:.0f} USDT</b>\n"
-        f"Starting balance: <b>${PAPER_BALANCE} USDT</b>\n"
-        f"Coins monitored: <b>{len(COINS)}</b>\n"
-        f"Min confidence: <b>{MIN_CONF}%</b>\n\n"
-        f"<b>Signal Engine v5 — 7 Indicators:</b>\n"
-        f"• RSI(14) — overbought/oversold filter\n"
-        f"• EMA 20/50 — trend direction\n"
-        f"• Volume ratio — spike detection\n"
-        f"• MACD — trend confirmation\n"
-        f"• ATR — dynamic SL + flat filter\n"
-        f"• Bollinger Bands — real breakouts\n"
-        f"• OBV — real vs fake volume\n\n"
-        f"<b>🛡️ Risk Management:</b>\n"
-        f"• Daily loss limit: {MAX_DAILY_LOSS_PCT*100:.0f}%\n"
-        f"• Consecutive loss limit: {MAX_CONSEC_LOSSES} hits\n"
-        f"• Max trade age: {MAX_TRADE_HOURS}h (auto-close)\n"
-        f"• BTC crash guard: {BTC_CRASH_PCT:.0f}% in 1h\n\n"
-        f"<b>📊 Commands:</b> /report /pause /resume /help\n\n"
-        f"Blocked: {', '.join(BLOCKED_COINS) or 'None'}\n\n"
-        f"<i>No real money at risk — pure data collection!</i>"
+        f"Trade size: <b>${TRADE_SIZE:.0f}</b> × {LEVERAGE}x = <b>${TRADE_SIZE*LEVERAGE:.0f} exposure</b>\n"
+        f"Max trades: <b>{MAX_OPEN_TRADES}</b> | Max same dir: <b>{MAX_SAME_DIRECTION}</b>\n"
+        f"Free cash floor: <b>{MIN_FREE_CASH_PCT*100:.0f}%</b>\n"
+        f"Min confidence: <b>{MIN_CONF}%</b>\n"
+        f"Blocked coins: <b>{len(BLOCKED_COINS)}</b>\n\n"
+        f"<b>🔧 Phase 1 Fixes Active:</b>\n"
+        f"• GAP SL — gaps fill at SL price, not liquidation\n"
+        f"• ATR cap — blocks coins with ATR > 8% (no more WAVES/HNT)\n"
+        f"• Direction cap — max {MAX_SAME_DIRECTION} per side (no all-SHORT cascades)\n"
+        f"• Free cash floor — {MIN_FREE_CASH_PCT*100:.0f}% always reserved\n"
+        f"• Smaller size — ${TRADE_SIZE:.0f} (was $200) | Fewer trades — {MAX_OPEN_TRADES} (was 8)\n\n"
+        f"<b>🛡️ Risk:</b> {MAX_DAILY_LOSS_PCT*100:.0f}% daily loss | {MAX_CONSEC_LOSSES} consec SL | {MAX_TRADE_HOURS}h max age\n\n"
+        f"<b>📊 Commands:</b> /report /r /pause /resume /help\n\n"
+        f"<i>Paper mode — collecting clean data for Phase 2</i>"
     )
 
     offset       = None
@@ -1820,6 +1878,10 @@ def run():
                     if not price or abs(change) < 2:
                         continue
 
+                    # ── Phase 1: Volume filter — skip low liquidity coins ──
+                    if not vol or vol < MIN_24H_VOLUME:
+                        continue
+
                     print(f"  {sym}: ${price} {round(change, 2)}%", end="")
 
                     ta = ta_map.get(sym)
@@ -1859,9 +1921,13 @@ def run():
                     sig["sig_id"]    = make_signal_id(sym)
                     last_signal[sym] = sig
 
-                    tg_send(make_signal_msg(coin, sig, price, change))
-                    paper_execute(coin, sig, price)
-                    print(f"  🚀 Paper signal: {sym} {sig['signal']} {sig['conf']}%")
+                    # ── Phase 1: Execute FIRST — only notify if trade opens ──
+                    opened = paper_execute(coin, sig, price)
+                    if opened:
+                        tg_send(make_signal_msg(coin, sig, price, change))
+                        print(f"  🚀 Paper signal: {sym} {sig['signal']} {sig['conf']}%")
+                    else:
+                        print(f"  ⛔ Signal rejected: {sym} {sig['signal']} {sig['conf']}%")
 
             time.sleep(2)
 
