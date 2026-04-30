@@ -116,6 +116,8 @@ copy_stats     = {
 }
 
 copy_paused    = False
+signal_log     = []   # last 20 signal events for /copydebug
+MAX_LOG        = 20
 
 session_http   = requests.Session()
 
@@ -199,84 +201,155 @@ def get_price(symbol_usdt):
         return None
 
 
+# ─────────────────────── DEBUG LOGGER ────────────────────────
+def log_signal_event(status, symbol, channel, reason="", extra=""):
+    """
+    Record signal event for /copydebug command.
+    Status: PARSED_OK | EXECUTED | QUEUED | EXECUTED_FROM_PENDING
+            EXPIRED_PENDING | REJECTED
+    """
+    global signal_log
+    entry = {
+        "time":    utc_now_str(),
+        "status":  status,
+        "symbol":  symbol,
+        "channel": channel_label(channel) if channel else "",
+        "reason":  reason,
+        "extra":   extra,
+    }
+    signal_log.append(entry)
+    if len(signal_log) > MAX_LOG:
+        signal_log = signal_log[-MAX_LOG:]
+    # Always print to Railway logs
+    print(f"  [{status}] {channel}/{symbol} — {reason} {extra}".strip())
+
+
 # ─────────────────────── SIGNAL PARSER ────────────────────────
+def _normalize_symbol(raw):
+    """
+    Normalize any symbol format to XXXUSDT.
+    Handles: SOLUSDT, SOL/USDT, #SOL/USDT, $SOL, SOL USDT
+    """
+    raw = raw.upper().strip()
+    # Remove # $ prefixes
+    raw = raw.lstrip('#$')
+    # Remove /USDT or USDT suffix then re-add
+    raw = raw.replace('/USDT', '').replace('USDT', '').strip()
+    # Remove trailing slash
+    raw = raw.rstrip('/')
+    if not raw:
+        return None
+    return raw + 'USDT'
+
+
 def parse_signal(text):
     """
-    Parse a raw Telegram signal message into structured data.
-    Handles multiple formats from GGShot, Coin_Signals, Raven.
-    Returns dict or None if not a valid signal.
+    Robust multi-format signal parser.
+    Returns parsed dict or None if not a valid signal.
+    Logs rejection reason for every failed parse.
+
+    A valid signal MUST have ALL of:
+      - Symbol
+      - Direction (LONG/SHORT)
+      - Entry zone or single entry price
+      - Stop Loss
+      - At least 1 Take Profit
     """
     if not text or len(text) < 20:
         return None
 
-    text_upper = text.upper()
+    t = text.upper()
+
+    # ── Quick pre-filter: skip obvious non-signals ──
+    noise_phrases = [
+        'TAKE-PROFIT TARGET', 'TP HIT', 'PROFIT:', 'BOOM', 'CONGRAT',
+        'JUST IN:', 'BREAKING', 'FED ', 'RATE ', 'ALL-TIME HIGH',
+        'BACK TO BACK', 'FLYING', 'SIGNALS THAT SPEAK', 'VIP CHANNEL',
+        'SUBSCRIBE', 'JOIN US', 'CONTACT:', 'TELEGRAM.ME',
+    ]
+    for phrase in noise_phrases:
+        if phrase in t:
+            return None
 
     # ── Direction ──
     direction = None
-    if any(w in text_upper for w in ["LONG", " BUY ", "BUY\n", "LONG\n"]):
-        direction = "BUY"
-    elif any(w in text_upper for w in ["SHORT", " SELL ", "SELL\n", "SHORT\n"]):
-        direction = "SELL"
+    if re.search(r'\bLONG\b|\bBUY\b', t):
+        direction = 'BUY'
+    elif re.search(r'\bSHORT\b|\bSELL\b', t):
+        direction = 'SELL'
     if not direction:
         return None
 
-    # ── Symbol ──
+    # ── Symbol — try multiple patterns ──
     symbol = None
-    # Format: #BTCUSDT or #BTC/USDT or BTCUSDT or BTC/USDT
     sym_patterns = [
-        r'#([A-Z]{2,10})(?:USDT|/USDT)',
-        r'\b([A-Z]{2,10})USDT\b',
-        r'\b([A-Z]{2,10})/USDT\b',
-        r'#([A-Z]{2,10})\b',
+        r'[#$]([A-Z]{2,10})[/\s]?USDT',   # #SOL/USDT or $SOL USDT
+        r'\b([A-Z]{2,10})USDT\b',           # SOLUSDT
+        r'\b([A-Z]{2,10})/USDT\b',          # SOL/USDT
+        r'[#$]([A-Z]{2,10})\b',             # #SOL or $SOL
+        r'\bPAIR[:\s]+([A-Z]{2,10})',       # PAIR: SOL
     ]
+    skip = {'TP', 'SL', 'BUY', 'SELL', 'LONG', 'SHORT', 'ENTRY',
+            'USDT', 'USD', 'THE', 'FOR', 'AND', 'STOP', 'TAKE',
+            'TARGET', 'PROFIT', 'LOSS', 'BINANCE', 'BYBIT'}
     for pat in sym_patterns:
-        m = re.search(pat, text_upper)
+        m = re.search(pat, t)
         if m:
-            sym = m.group(1).strip()
-            # Skip common false positives
-            if sym not in ("TP", "SL", "BUY", "SELL", "LONG", "SHORT",
-                           "ENTRY", "USDT", "USD", "THE", "FOR"):
-                symbol = sym + "USDT"
+            raw = m.group(1).strip()
+            if raw not in skip and len(raw) >= 2:
+                symbol = _normalize_symbol(raw)
                 break
     if not symbol:
-        return None
+        return None  # REJECTED: no symbol
 
     # ── Entry zone ──
     entry_low = entry_high = None
     zone_patterns = [
-        r'(?:ENTRY|BUY\s*ZONE?|ENTRY\s*ZONE?|ENTER)[:\s]+([0-9.]+)\s*[-–]\s*([0-9.]+)',
-        r'([0-9.]+)\s*[-–]\s*([0-9.]+)',  # fallback: any range
+        # "Entry: 85.31 - 87.86" or "Entry Zone: 85.31-87.86"
+        r'ENTRY\s*(?:ZONE)?[:\s]*([0-9.]+)\s*[-–TO]+\s*([0-9.]+)',
+        # "Buy Zone 2.10 - 2.08"
+        r'(?:BUY|ENTRY)\s*ZONE[:\s]*([0-9.]+)\s*[-–TO]+\s*([0-9.]+)',
+        # "85.31 to 87.86"
+        r'([0-9.]+)\s+TO\s+([0-9.]+)',
+        # Generic range "85.31 - 87.86" (must be near entry keyword)
+        r'(?:ENTRY|ZONE|PRICE)[^\n]*?([0-9.]+)\s*[-–]\s*([0-9.]+)',
     ]
     for pat in zone_patterns:
-        m = re.search(pat, text_upper)
+        m = re.search(pat, t)
         if m:
             try:
                 a, b = float(m.group(1)), float(m.group(2))
-                entry_low, entry_high = min(a, b), max(a, b)
-                break
+                if a > 0 and b > 0:
+                    entry_low  = min(a, b)
+                    entry_high = max(a, b)
+                    break
             except Exception:
                 pass
 
     # Single entry price fallback
     if not entry_low:
-        m = re.search(r'(?:ENTRY|PRICE)[:\s]+([0-9.]+)', text_upper)
+        m = re.search(r'ENTRY[:\s]+([0-9.]+)', t)
         if m:
             try:
                 v = float(m.group(1))
-                entry_low = entry_high = v
+                if v > 0:
+                    # Create a small zone ±0.5% around single price
+                    entry_low  = round(v * 0.995, 8)
+                    entry_high = round(v * 1.005, 8)
             except Exception:
                 pass
 
     if not entry_low:
-        return None  # must have entry
+        return None  # REJECTED: no entry
 
     # ── Stop Loss (required) ──
     sl = None
     sl_patterns = [
-        r'(?:STOP\s*LOSS|SL|STOP)[:\s]+([0-9.]+)',
+        r'(?:STOPLOSS|STOP\s*LOSS|STOP)[:\s]+([0-9.]+)',
+        r'\bSL[:\s]+([0-9.]+)',
     ]
     for pat in sl_patterns:
-        m = re.search(pat, text_upper)
+        m = re.search(pat, t)
         if m:
             try:
                 sl = float(m.group(1))
@@ -284,46 +357,58 @@ def parse_signal(text):
             except Exception:
                 pass
     if not sl:
-        return None  # no SL = skip signal
+        return None  # REJECTED: no SL
 
-    # ── Take Profits ──
+    # ── Take Profits (at least 1 required) ──
     tps = []
     tp_patterns = [
-        r'(?:TP|TARGET|T)\s*(\d)\s*[:\s]+([0-9.]+)',
-        r'(?:TP|TARGET)\s*[:\s]+([0-9.]+)',
+        r'(?:TARGET|TAKE.?PROFIT|TP)\s*(\d)\s*[:\s]+([0-9.]+)',
+        r'(?:TARGET|TP)[:\s]+([0-9.]+)',
+        r'T\s*(\d)\s*[:\s]+([0-9.]+)',
     ]
+    seen = set()
     for pat in tp_patterns:
-        for m in re.finditer(pat, text_upper):
+        for m in re.finditer(pat, t):
             try:
                 val = float(m.group(2) if m.lastindex >= 2 else m.group(1))
-                if val not in tps:
+                if val > 0 and val not in seen:
+                    seen.add(val)
                     tps.append(val)
             except Exception:
                 pass
 
     if not tps:
-        return None  # need at least 1 TP
+        return None  # REJECTED: no TPs
 
-    # Pad to 4 TPs — extrapolate if less than 4
+    # Sort TPs in correct direction
+    if direction == 'BUY':
+        tps = sorted(tps)       # ascending for longs
+    else:
+        tps = sorted(tps, reverse=True)  # descending for shorts
+
+    # Pad to 4 TPs
     while len(tps) < 4:
         if len(tps) >= 2:
-            diff = tps[-1] - tps[-2]
-            tps.append(round(tps[-1] + diff, 8))
+            diff = abs(tps[-1] - tps[-2])
+            if direction == 'BUY':
+                tps.append(round(tps[-1] + diff, 8))
+            else:
+                tps.append(round(tps[-1] - diff, 8))
         else:
-            gap = abs(tps[0] - entry_low) * 0.5
-            if direction == "BUY":
+            gap = abs(tps[0] - (entry_low + entry_high) / 2) * 0.5
+            if direction == 'BUY':
                 tps.append(round(tps[-1] + gap, 8))
             else:
                 tps.append(round(tps[-1] - gap, 8))
 
-    # ── Validate direction vs SL/TP ──
+    # ── Validate direction logic ──
     entry_mid = (entry_low + entry_high) / 2
-    if direction == "BUY":
-        if sl >= entry_mid:   return None  # SL above entry = invalid
-        if tps[0] <= entry_mid: return None  # TP below entry = invalid
+    if direction == 'BUY':
+        if sl >= entry_mid:     return None  # SL above entry — invalid
+        if tps[0] <= entry_mid: return None  # TP below entry — invalid
     else:
-        if sl <= entry_mid:   return None
-        if tps[0] >= entry_mid: return None
+        if sl <= entry_mid:     return None  # SL below entry — invalid
+        if tps[0] >= entry_mid: return None  # TP above entry — invalid
 
     return {
         "symbol":      symbol,
@@ -549,16 +634,27 @@ def check_pending_signals():
         for sym, ps in list(pending.items()):
             if now > ps["expires_at"]:
                 expired.append(sym)
-                print(f"  ⏰ Pending signal expired: {channel}/{sym}")
+                log_signal_event("EXPIRED_PENDING", sym, channel,
+                                 "2h window passed without price entering zone")
                 continue
             price = get_price(sym)
             if not price:
                 continue
-            sig = ps["sig"]
+            sig     = ps["sig"]
             in_zone = sig["entry_low"] <= price <= sig["entry_high"]
             if in_zone:
-                print(f"  ✅ Price entered zone: {channel}/{sym} @ {price}")
-                copy_execute(channel, sig, price, ps["msg_id"])
+                # Check still valid
+                with state_lock:
+                    if sym in copy_positions[channel]:
+                        expired.append(sym)
+                        continue
+                    if len(copy_positions[channel]) >= COPY_MAX_OPEN:
+                        expired.append(sym)
+                        continue
+                opened = copy_execute(channel, sig, price, ps["msg_id"])
+                if opened:
+                    log_signal_event("EXECUTED_FROM_PENDING", sym, channel,
+                                     "price entered zone", f"price={price}")
                 expired.append(sym)
 
         for sym in expired:
@@ -711,6 +807,59 @@ def _cmd_copychannels():
     )
 
 
+def _cmd_copydebug():
+    """Show last 10 signal events."""
+    if not signal_log:
+        return "<b>📋 COPY DEBUG</b>\n\nNo signals received yet."
+    recent = signal_log[-10:]
+    icons  = {
+        "PARSED_OK":             "🔍",
+        "EXECUTED":              "✅",
+        "QUEUED":                "⏳",
+        "EXECUTED_FROM_PENDING": "🚀",
+        "EXPIRED_PENDING":       "⏰",
+        "REJECTED":              "❌",
+    }
+    lines = []
+    for e in reversed(recent):
+        icon = icons.get(e["status"], "•")
+        lines.append(
+            f"{icon} <b>{e['status']}</b> — {e['channel']}/{e['symbol']}\n"
+            f"   {e['time']}  {e['reason']}"
+        )
+    return (
+        f"<b>📋 COPY DEBUG — last {len(recent)} signals</b>\n"
+        f"══════════════════════════════\n\n"
+        + "\n\n".join(lines)
+    )
+
+
+def _cmd_pendingcopy():
+    """Show all pending signals with time remaining."""
+    lines = []
+    now   = time.time()
+    for channel, pending in pending_signals.items():
+        for sym, ps in pending.items():
+            sig         = ps["sig"]
+            remaining   = max(0, ps["expires_at"] - now)
+            mins        = int(remaining // 60)
+            price       = get_price(sym)
+            price_str   = fmt_p(price) if price else "N/A"
+            side        = "LONG" if sig["direction"] == "BUY" else "SHORT"
+            lines.append(
+                f"<b>{sym}</b> {side} [{channel_label(channel)}]\n"
+                f"  Zone: {fmt_p(sig['entry_low'])} – {fmt_p(sig['entry_high'])}\n"
+                f"  Now:  {price_str}  |  Expires: {mins}m"
+            )
+    if not lines:
+        return "<b>⏳ PENDING SIGNALS</b>\n\nNone waiting."
+    return (
+        f"<b>⏳ PENDING SIGNALS ({len(lines)})</b>\n"
+        f"══════════════════════════════\n\n"
+        + "\n\n".join(lines)
+    )
+
+
 def check_copy_commands(offset):
     global copy_paused
     updates = tg_updates(offset)
@@ -723,6 +872,10 @@ def check_copy_commands(offset):
                 tg_send(_cmd_copyreport())
             elif text == "/copychannels":
                 tg_send(_cmd_copychannels())
+            elif text == "/copydebug":
+                tg_send(_cmd_copydebug())
+            elif text == "/pendingcopy":
+                tg_send(_cmd_pendingcopy())
             elif text == "/copypause":
                 copy_paused = True
                 tg_send("<b>⏸ Copy engine paused.</b>")
@@ -732,11 +885,13 @@ def check_copy_commands(offset):
             elif text == "/copyhelp":
                 tg_send(
                     "<b>📡 Copy Lab Commands</b>\n\n"
-                    "/copyreport   — Full lab report\n"
-                    "/copychannels — Show tracked channels\n"
-                    "/copypause    — Pause new copies\n"
-                    "/copyresume   — Resume\n"
-                    "/copyhelp     — This message"
+                    "/copyreport    — Full lab report\n"
+                    "/copychannels  — Show tracked channels\n"
+                    "/copydebug     — Last 10 signal events\n"
+                    "/pendingcopy   — Pending signals + time left\n"
+                    "/copypause     — Pause new copies\n"
+                    "/copyresume    — Resume\n"
+                    "/copyhelp      — This message"
                 )
     return offset
 
@@ -835,33 +990,57 @@ def start_telethon():
 
             print(f"  📨 New msg from {channel_key}: {text[:60]}")
             sig = parse_signal(text)
+
             if not sig:
+                # Log rejection with reason
+                t = text.upper()
+                if not any(w in t for w in ['LONG','SHORT','BUY','SELL']):
+                    reason = "no direction"
+                elif not any(w in t for w in ['USDT','BTC','ETH','SOL','BNB']):
+                    reason = "no symbol"
+                elif not any(w in t for w in ['SL','STOP']):
+                    reason = "missing SL"
+                elif not any(w in t for w in ['TP','TARGET','TAKE']):
+                    reason = "no targets"
+                elif not any(w in t for w in ['ENTRY','ZONE','BUY ZONE']):
+                    reason = "no entry zone"
+                else:
+                    reason = "invalid format"
+                log_signal_event("REJECTED", "?", channel_key, reason,
+                                 text[:40].replace('\n',' '))
                 return
+
+            sym = sig["symbol"]
+            log_signal_event("PARSED_OK", sym, channel_key,
+                             f"{sig['direction']} entry={sig['entry_low']}-{sig['entry_high']} SL={sig['sl']}")
 
             if copy_paused:
-                print(f"  ⏸ Copy paused — skipping {channel_key}/{sig['symbol']}")
-                return
-
-            sym   = sig["symbol"]
-            price = get_price(sym)
-            if not price:
-                print(f"  ❌ No price for {sym}")
+                log_signal_event("REJECTED", sym, channel_key, "copy engine paused")
                 return
 
             # Safety filters
             with state_lock:
                 if sym in copy_positions[channel_key]:
-                    print(f"  ⛔ {sym} already open in {channel_key}")
+                    log_signal_event("REJECTED", sym, channel_key, "already open")
                     return
                 if len(copy_positions[channel_key]) >= COPY_MAX_OPEN:
-                    print(f"  ⛔ Max trades for {channel_key}")
+                    log_signal_event("REJECTED", sym, channel_key,
+                                     f"max {COPY_MAX_OPEN} trades open")
                     return
+
+            price = get_price(sym)
+            if not price:
+                log_signal_event("REJECTED", sym, channel_key, "no price available")
+                return
 
             # Check if price is inside entry zone
             in_zone = sig["entry_low"] <= price <= sig["entry_high"]
 
             if in_zone:
-                copy_execute(channel_key, sig, price, msg_id)
+                opened = copy_execute(channel_key, sig, price, msg_id)
+                if opened:
+                    log_signal_event("EXECUTED", sym, channel_key,
+                                     "inside entry zone", f"price={price}")
             else:
                 # Queue as pending — wait up to 2 hours
                 with state_lock:
@@ -869,14 +1048,18 @@ def start_telethon():
                         "sig":        sig,
                         "msg_id":     msg_id,
                         "expires_at": time.time() + COPY_SIGNAL_TTL,
+                        "created_at": time.time(),
                     }
                 label = channel_label(channel_key)
                 side  = "LONG" if sig["direction"] == "BUY" else "SHORT"
+                above_below = "above" if price > sig["entry_high"] else "below"
+                log_signal_event("QUEUED", sym, channel_key,
+                                 f"price {price} {above_below} zone {sig['entry_low']}-{sig['entry_high']}")
                 tg_send(
                     f"<b>⏳ COPY SIGNAL QUEUED — {sym}</b>\n"
                     f"Source: {label}  |  {side}\n"
                     f"Zone: {fmt_p(sig['entry_low'])} – {fmt_p(sig['entry_high'])}\n"
-                    f"Current price: {fmt_p(price)}\n"
+                    f"Current price: {fmt_p(price)} ({above_below} zone)\n"
                     f"<i>Waiting up to 2h for price to enter zone.</i>"
                 )
                 print(f"  ⏳ Queued {channel_key}/{sym} — waiting for zone entry")
