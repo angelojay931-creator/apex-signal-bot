@@ -15,13 +15,11 @@ KEY RULES:
 - APEX blocked coins DO NOT apply here
 - APEX RSI/EMA/MACD filters DO NOT apply here
 
-Railway env vars:
-  TELEGRAM_TOKEN
-  TELEGRAM_CHAT_ID
-  TELEGRAM_API_ID
-  TELEGRAM_API_HASH
-  TELETHON_SESSION
-  COPY_DATA_DIR   (default: /app)
+NEW SAFETY CHECKS:
+- Reject stale signals (> 5 minutes old)
+- Reject if live price is already on the wrong side of SL
+- Reject if live price already reached TP1
+- Force-close positions open > 48 hours
 """
 
 import os
@@ -42,6 +40,11 @@ COPY_TRADE_SIZE   = 100.0    # $100 margin per copied trade
 COPY_LEVERAGE     = 10       # 10x → $1000 exposure
 COPY_MAX_OPEN     = 3        # max open per channel
 COPY_SLIPPAGE_PCT = 0.001    # 0.1% slippage simulation
+
+# Safety filters
+MAX_SIGNAL_AGE_SEC = 300     # ignore signals older than 5 minutes
+SAFE_SL_BUFFER     = 0.005   # 0.5% buffer – live price must be clearly on the right side of SL
+MAX_COPY_HOURS     = 48      # force-close copy positions older than this
 
 # Per-channel starting balances
 CHANNEL_BALANCES = {
@@ -132,7 +135,7 @@ def log_event(status, symbol, channel, reason=""):
     signal_log.append(entry)
     if len(signal_log) > MAX_LOG:
         signal_log = signal_log[-MAX_LOG:]
-    icon = {"EXECUTED": "✅", "REJECTED": "❌", "PARSED_OK": "🔍"}.get(status, "•")
+    icon = {"EXECUTED": "✅", "REJECTED": "❌", "PARSED_OK": "🔍", "EXPIRED": "⏰"}.get(status, "•")
     print(f"  [{status}] {channel}/{symbol} — {reason}")
 
 
@@ -288,8 +291,6 @@ def parse_signal(text):
         return None
 
     # ── Take Profits (need at least 1) ──
-    # Pattern: match TARGET/TP followed by number
-    # Must be a real price — filter out bare integers 1,2,3,4 (TP numbering)
     tps = []
     seen_vals = set()
     for pat in [
@@ -304,7 +305,6 @@ def parse_signal(text):
             try:
                 val = float(m.group(1))
                 # Skip bare TP numbering (1, 2, 3, 4) — not a real price
-                # Real prices are either decimal OR integer > 10
                 if val <= 10 and '.' not in m.group(1):
                     continue
                 if val > 0 and val not in seen_vals:
@@ -328,12 +328,13 @@ def parse_signal(text):
         tps.append(round(nxt, 8))
 
     # ── Validate SL vs TP direction logic ──
-    # Use TP1 as reference since we enter at market price
     tp1 = tps[0]
     if direction == "BUY":
-        if sl >= tp1:   return None  # SL above TP = invalid
+        if sl >= tp1:
+            return None
     else:
-        if sl <= tp1:   return None  # SL below TP = invalid
+        if sl <= tp1:
+            return None
 
     return {
         "symbol":    symbol,
@@ -347,14 +348,44 @@ def parse_signal(text):
 
 
 # ─────────────────────────── EXECUTE ──────────────────────────
+def is_sl_safe(direction, sl, liq_price):
+    """Reject if SL is less than 2% from liquidation (same logic as main bot)."""
+    if liq_price <= 0 or sl <= 0:
+        return False
+    # Using LIQ_BUFFER_PCT = 0.02 (2%) – defined locally
+    buffer = 0.02
+    if direction == "BUY":
+        return sl >= liq_price * (1 + buffer)
+    else:
+        return sl <= liq_price * (1 - buffer)
+
+
 def copy_execute(channel, sig, price, msg_id):
     """
     Open a paper copy trade at current live market price.
-    Ignores entry zone — enters immediately.
+    Safety checks: stale message already handled, SL validation, TP1 already reached.
     """
     sym       = sig["symbol"]
     direction = sig["direction"]
     notional  = COPY_TRADE_SIZE * COPY_LEVERAGE
+
+    # ── Reject if SL is on the wrong side of the live price ──
+    sl = sig["sl"]
+    if direction == "BUY" and price <= sl * (1 + SAFE_SL_BUFFER):
+        log_event("REJECTED", sym, channel, "live price already below SL")
+        return False
+    if direction == "SELL" and price >= sl * (1 - SAFE_SL_BUFFER):
+        log_event("REJECTED", sym, channel, "live price already above SL")
+        return False
+
+    # ── Reject if TP1 already reached ──
+    tp1 = sig["tp1"]
+    if direction == "BUY" and price >= tp1:
+        log_event("REJECTED", sym, channel, "price already beyond TP1")
+        return False
+    if direction == "SELL" and price <= tp1:
+        log_event("REJECTED", sym, channel, "price already beyond TP1")
+        return False
 
     if direction == "BUY":
         exec_price = round(price * (1 + COPY_SLIPPAGE_PCT), 8)
@@ -362,6 +393,11 @@ def copy_execute(channel, sig, price, msg_id):
     else:
         exec_price = round(price * (1 - COPY_SLIPPAGE_PCT), 8)
         liq_price  = round(exec_price * (1 + 0.9 / COPY_LEVERAGE), 8)
+
+    # ── Liq buffer check ──
+    if not is_sl_safe(direction, sl, liq_price):
+        log_event("REJECTED", sym, channel, "SL too close to liquidation")
+        return False
 
     with state_lock:
         if sym in copy_positions[channel]:
@@ -555,6 +591,61 @@ def monitor_copy_positions():
             tg_send(msg)
 
 
+# ─────────────────────────── STALE CLOSE ──────────────────────
+def check_stale_copy_positions():
+    """Close copy positions open > MAX_COPY_HOURS."""
+    for channel in list(copy_positions.keys()):
+        to_remove = []
+        with state_lock:
+            for sym, pos in list(copy_positions[channel].items()):
+                age_h = (time.time() - pos["opened_at"]) / 3600
+                if age_h > MAX_COPY_HOURS:
+                    # Close at current market price
+                    price = get_price(sym)
+                    if not price:
+                        price = pos["exec_price"]  # fallback
+                    direction = pos["direction"]
+                    exec_price = pos["exec_price"]
+                    tp_hit = pos["tp_hit"]
+                    margin = pos["margin"]
+                    rem_pct = 1.0 - (tp_hit * 0.25)
+                    remaining_margin = margin * rem_pct
+
+                    if exec_price > 0:
+                        if direction == "BUY":
+                            move_pct = (price - exec_price) / exec_price * 100
+                        else:
+                            move_pct = (exec_price - price) / exec_price * 100
+                        unrealized_pnl = round(margin * COPY_LEVERAGE * move_pct / 100 * rem_pct, 2)
+                    else:
+                        unrealized_pnl = 0.0
+
+                    prior_realized = pos.get("currentPnl", 0)
+                    total_trade_pnl = round(prior_realized + unrealized_pnl, 2)
+
+                    # Only add unrealized to stats (TP profits already counted)
+                    if unrealized_pnl >= 0:
+                        copy_stats[channel]["profit"] += unrealized_pnl
+                    else:
+                        copy_stats[channel]["loss"] += abs(unrealized_pnl)
+
+                    copy_balances[channel] += remaining_margin + unrealized_pnl
+                    copy_stats[channel]["total"] += 1
+
+                    _save_copy_trade(channel, sym, pos, price, "STALE_CLOSE", total_trade_pnl)
+                    to_remove.append(sym)
+                    tg_send(
+                        f"<b>⏰ COPY STALE CLOSE — {sym}</b>\n"
+                        f"Source: {channel_label(channel)}\n"
+                        f"Age: {age_h:.1f}h  |  Final P&L: {'+' if total_trade_pnl>=0 else ''}${total_trade_pnl:.2f}\n"
+                        f"Balance [{channel_label(channel)}]: ${copy_balances[channel]:.2f}"
+                    )
+
+        with state_lock:
+            for sym in to_remove:
+                copy_positions[channel].pop(sym, None)
+
+
 # ─────────────────────────── PERSISTENCE ──────────────────────
 def _ensure_dirs():
     try:
@@ -623,7 +714,6 @@ def load_copy_history():
                 copy_stats[ch]["loss"]   += abs(pnl)
             if cr in ("SL", "GAP_SL"):
                 copy_stats[ch]["sl_hit"] += 1
-        # Restore balances from history
         for ch in copy_balances:
             hist_net = sum(r["pnl_usdt"] for r in copy_closed[ch])
             copy_balances[ch] = round(CHANNEL_BALANCES[ch] + hist_net, 2)
@@ -810,9 +900,14 @@ def start_telethon():
             if copy_paused:
                 return
 
+            # ── Stale signal rejection ──
+            msg_age = time.time() - event.message.date.timestamp()
+            if msg_age > MAX_SIGNAL_AGE_SEC:
+                log_event("EXPIRED", None, channel_key, f"stale ({msg_age:.0f}s old)")
+                return
+
             sig = parse_signal(text)
             if not sig:
-                # Log rejection reason
                 t = text.upper()
                 if not re.search(r"#?LONG\b|#?BUY\b|#?SHORT\b|#?SELL\b", t):
                     reason = "no direction"
@@ -831,7 +926,6 @@ def start_telethon():
             log_event("PARSED_OK", sym, channel_key,
                       f"{sig['direction']} SL={sig['sl']}")
 
-            # Check not already open
             with state_lock:
                 if sym in copy_positions[channel_key]:
                     log_event("REJECTED", sym, channel_key, "already open")
@@ -841,7 +935,6 @@ def start_telethon():
                               f"max {COPY_MAX_OPEN} open")
                     return
 
-            # Get live price and enter immediately
             price = get_price(sym)
             if not price:
                 log_event("REJECTED", sym, channel_key, "no price from Binance")
@@ -886,7 +979,9 @@ def run():
         f"Trade size: <b>${COPY_TRADE_SIZE:.0f} x {COPY_LEVERAGE}x</b> = "
         f"<b>${COPY_TRADE_SIZE*COPY_LEVERAGE:.0f} exposure</b>\n"
         f"Entry: <b>Live market price</b> (no zone waiting)\n"
-        f"Max per channel: <b>{COPY_MAX_OPEN}</b>\n\n"
+        f"Max per channel: <b>{COPY_MAX_OPEN}</b>\n"
+        f"Signal age limit: <b>{MAX_SIGNAL_AGE_SEC}s</b>\n"
+        f"Max trade age: <b>{MAX_COPY_HOURS}h</b>\n\n"
         f"<b>Balances:</b>\n"
         + "\n".join(f"  {channel_label(ch)}: ${copy_balances[ch]:.2f}"
                     for ch in copy_balances) +
@@ -899,6 +994,7 @@ def run():
         try:
             offset = check_copy_commands(offset)
             monitor_copy_positions()
+            check_stale_copy_positions()   # added stale position cleanup
             time.sleep(10)
         except KeyboardInterrupt:
             print("\nCopy Lab stopped.")
