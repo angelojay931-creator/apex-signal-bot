@@ -43,7 +43,8 @@ LEVERAGE           = 5         # 5x → $500 exposure per trade ($100 × 5)
 MIN_CONF           = 82        # Lowered from 85 - more signals, still quality
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
-MAX_OPEN_TRADES    = 6         # Phase 1 speed-up: 6 trades — $600 max deployed
+MAX_OPEN_TRADES    = 8         # 8 trades → $800 max deployed (Phase 2 sprint)
+MAX_SAME_DIRECTION = 4         # 4 per side → allows 4 longs + 4 shorts
 
 SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
@@ -51,6 +52,7 @@ PRE_WARN_TTL       = 7200
 GAP_SLIPPAGE_PCT   = 0.005    # Phase 1: gap fill slippage when price skips SL
 LIQ_BUFFER_PCT     = 0.02     # Phase 1: SL must be at least 2% before liq price
 MIN_24H_VOLUME     = 300_000_000  # Phase 1: skip coins with <$300M 24h volume
+MAX_SL_PCT         = 0.03     # Maximum stop-loss distance as % of entry (ATR-based)
 
 BLOCKED_COINS = {
     # Liquidated us - extreme gap risk
@@ -65,16 +67,13 @@ BLOCKED_COINS = {
 }
 
 # ─────────────── PROFESSIONAL RISK MANAGEMENT ─────────────────
-# Circuit breakers - protect capital when things go wrong
 MAX_DAILY_LOSS_PCT  = 0.06   # 6% daily loss limit — tighter than 8%, allows 6 trades
 MAX_CONSEC_LOSSES   = 3      # Pause after 3 consecutive SL hits
 MAX_TRADE_HOURS     = 48     # Force-close positions open > 48 hours
 BTC_CRASH_PCT       = -5.0   # Pause new signals if BTC drops >5% in 1h
-MAX_SAME_DIRECTION  = 3      # Phase 1 speed-up: max 3 SHORTs + 3 LONGs at any time
-MIN_FREE_CASH_PCT   = 0.30   # 30% free cash floor — allows 6 × $100 on $2,000
+MIN_FREE_CASH_PCT   = 0.30   # 30% free cash floor — allows 8 × $100 on $2,000
 
 # ─────────────────────────── STATE ────────────────────────────
-# RLock: reentrant - make_tp_msg/make_sl_msg re-acquire inside monitor_positions
 state_lock    = threading.RLock()
 
 positions     = {}
@@ -94,20 +93,18 @@ stats = {
 
 last_signal = {}
 
-# ───────────────── RISK MANAGEMENT STATE ──────────────────────
 risk_state = {
-    "session_start_balance": PAPER_BALANCE,  # reset on bot start
-    "consec_losses":         0,              # consecutive SL hits
-    "trading_paused":        False,          # circuit breaker flag
-    "pause_reason":          "",             # why trading is paused
-    "btc_last_price":        None,           # for BTC crash detection
-    "btc_last_check":        0.0,            # timestamp of last BTC check
-    "pause_until":           0.0,            # auto-resume timestamp (0 = manual only)
-    "daily_reset_at":        0.0,            # timestamp of last daily loss reset
+    "session_start_balance": PAPER_BALANCE,
+    "consec_losses":         0,
+    "trading_paused":        False,
+    "pause_reason":          "",
+    "btc_last_price":        None,
+    "btc_last_check":        0.0,
+    "pause_until":           0.0,
+    "daily_reset_at":        0.0,
 }
 
 # ─────────────────────────── COINS ────────────────────────────
-# Top 200 coins by market cap - stablecoins and wrapped tokens excluded
 COINS = [
     # ── TOP 10 ──
     {"id": "bitcoin",                   "symbol": "BTC",     "bybit": "BTCUSDT"},
@@ -316,13 +313,6 @@ def calc_trade_size():
 
 # ─────────────── PROFESSIONAL RISK MANAGEMENT ─────────────────
 def check_circuit_breakers(scan_prices=None):
-    """
-    Professional circuit breakers - pause trading when:
-    1. Daily drawdown > MAX_DAILY_LOSS_PCT (8%) - resets at midnight UTC
-    2. Consecutive SL losses >= MAX_CONSEC_LOSSES (3) - auto-resumes after 1h
-    3. BTC drops > BTC_CRASH_PCT (-5%) in last hour - auto-resumes after 2h
-    Returns True if trading should be paused.
-    """
     global risk_state
 
     with state_lock:
@@ -334,8 +324,7 @@ def check_circuit_breakers(scan_prices=None):
     now       = time.time()
     start_bal = risk_state["session_start_balance"]
 
-    # ── Auto-resume check - runs before all triggers ──
-    # If a timed pause has expired, clear it regardless of which trigger set it
+    # Auto-resume check
     if risk_state["trading_paused"] and risk_state["pause_until"] > 0:
         if now >= risk_state["pause_until"]:
             risk_state["trading_paused"] = False
@@ -349,15 +338,13 @@ def check_circuit_breakers(scan_prices=None):
                 f"Total capital: ${total_capital:.2f} USDT"
             )
 
-    # ── Daily reset at midnight UTC ──
-    # Reset session_start_balance each new UTC day so daily loss tracks correctly
+    # Daily reset at midnight UTC
     midnight_today = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0).timestamp()
     if risk_state["daily_reset_at"] < midnight_today:
         risk_state["daily_reset_at"]        = midnight_today
         risk_state["session_start_balance"] = total_capital
         start_bal                           = total_capital
-        # If paused for daily loss, clear it on new day
         if risk_state["trading_paused"] and "daily loss" in risk_state["pause_reason"].lower():
             risk_state["trading_paused"] = False
             risk_state["pause_reason"]   = ""
@@ -369,14 +356,14 @@ def check_circuit_breakers(scan_prices=None):
                 f"Trading resumed for new UTC day."
             )
 
-    # ── 1. Daily loss limit ──
+    # Daily loss limit
     drawdown_pct = (total_capital - start_bal) / start_bal * 100
     if drawdown_pct <= -(MAX_DAILY_LOSS_PCT * 100):
         if not risk_state["trading_paused"]:
             reason = f"Daily loss limit hit ({drawdown_pct:.1f}% drawdown)"
             risk_state["trading_paused"] = True
             risk_state["pause_reason"]   = reason
-            risk_state["pause_until"]    = 0.0   # manual resume or midnight reset
+            risk_state["pause_until"]    = 0.0
             tg_send(
                 f"<b>🛑 CIRCUIT BREAKER - Trading Paused</b>\n\n"
                 f"Reason: {reason}\n"
@@ -387,13 +374,13 @@ def check_circuit_breakers(scan_prices=None):
             )
         return True
 
-    # ── 2. Consecutive losses - auto-resume after 1 hour ──
+    # Consecutive losses
     if risk_state["consec_losses"] >= MAX_CONSEC_LOSSES:
         if not risk_state["trading_paused"]:
             reason = f"{MAX_CONSEC_LOSSES} consecutive SL hits"
             risk_state["trading_paused"] = True
             risk_state["pause_reason"]   = reason
-            risk_state["pause_until"]    = now + 3600   # 1 hour
+            risk_state["pause_until"]    = now + 3600
             resume_time = datetime.fromtimestamp(now + 3600, tz=timezone.utc).strftime("%H:%M UTC")
             tg_send(
                 f"<b>⚠️ CONSECUTIVE LOSS LIMIT - Pausing 1 hour</b>\n\n"
@@ -404,7 +391,7 @@ def check_circuit_breakers(scan_prices=None):
             )
         return True
 
-    # ── 3. BTC crash guard - auto-resume after 2 hours ──
+    # BTC crash guard
     if scan_prices and time.time() - risk_state["btc_last_check"] >= 3600:
         btc_now  = (scan_prices.get("bitcoin") or {}).get("usd")
         btc_prev = risk_state["btc_last_price"]
@@ -418,7 +405,7 @@ def check_circuit_breakers(scan_prices=None):
                         reason = f"BTC crashed {btc_change:.1f}% in 1h"
                         risk_state["trading_paused"] = True
                         risk_state["pause_reason"]   = reason
-                        risk_state["pause_until"]    = now + 7200   # 2 hours
+                        risk_state["pause_until"]    = now + 7200
                         resume_time = datetime.fromtimestamp(now + 7200, tz=timezone.utc).strftime("%H:%M UTC")
                         tg_send(
                             f"<b>🚨 BTC CRASH DETECTED - Pausing signals</b>\n\n"
@@ -429,7 +416,6 @@ def check_circuit_breakers(scan_prices=None):
                         )
                     return True
 
-    # ── Resume if all conditions clear ──
     if risk_state["trading_paused"] and risk_state["pause_until"] == 0.0:
         risk_state["trading_paused"] = False
         risk_state["pause_reason"]   = ""
@@ -443,11 +429,6 @@ def check_circuit_breakers(scan_prices=None):
 
 
 def check_stale_positions():
-    """
-    Force-close positions that have been open > MAX_TRADE_HOURS.
-    Professional traders never let a trade run indefinitely.
-    Returns list of symbols to close.
-    """
     stale = []
     max_seconds = MAX_TRADE_HOURS * 3600
     with state_lock:
@@ -458,7 +439,7 @@ def check_stale_positions():
     return stale
 
 
-# ──────────────────── RSI / EMA / MACD / ATR / BB / OBV ──────────────────────
+# ──────────────────── TECHNICAL INDICATORS ─────────────────────
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -495,37 +476,23 @@ def calc_volume_ratio(volumes):
 
 
 def calc_macd(closes, fast=12, slow=26, signal=9):
-    """
-    MACD = EMA(12) - EMA(26), Signal = EMA(9) of MACD line.
-    FIX: O(n) incremental EMA - no longer recalculates full EMA per candle.
-    Returns: (macd_val, signal_val, histogram, is_bullish)
-    """
     if len(closes) < slow + signal:
         return None, None, None, None
-
-    # Seed EMAs on first 'slow' candles, then roll forward
     k_fast = 2 / (fast + 1)
     k_slow = 2 / (slow + 1)
     k_sig  = 2 / (signal + 1)
-
     ema_f = sum(closes[:fast]) / fast
     ema_s = sum(closes[:slow]) / slow
-
-    # Walk forward from slow-1 to build the MACD line
     macd_line = []
     for price in closes[slow:]:
         ema_f = price * k_fast + ema_f * (1 - k_fast)
         ema_s = price * k_slow + ema_s * (1 - k_slow)
         macd_line.append(ema_f - ema_s)
-
     if len(macd_line) < signal:
         return None, None, None, None
-
-    # Seed signal EMA on first 'signal' MACD values
     sig_ema = sum(macd_line[:signal]) / signal
     for m in macd_line[signal:]:
         sig_ema = m * k_sig + sig_ema * (1 - k_sig)
-
     macd_val   = round(macd_line[-1], 8)
     signal_val = round(sig_ema, 8)
     histogram  = round(macd_val - signal_val, 8)
@@ -534,12 +501,6 @@ def calc_macd(closes, fast=12, slow=26, signal=9):
 
 
 def calc_atr(candles, period=14):
-    """
-    ATR = Average True Range over period candles
-    True Range = max(high-low, |high-prev_close|, |low-prev_close|)
-    Uses close as proxy since we only have OHLCV from Binance
-    Returns ATR value and ATR as % of current price
-    """
     if len(candles) < period + 1:
         return None, None
     trs = []
@@ -547,13 +508,8 @@ def calc_atr(candles, period=14):
         high  = candles[i].get("high",  candles[i]["close"] * 1.005)
         low   = candles[i].get("low",   candles[i]["close"] * 0.995)
         prev_c = candles[i-1]["close"]
-        tr = max(
-            high - low,
-            abs(high - prev_c),
-            abs(low  - prev_c),
-        )
+        tr = max(high - low, abs(high - prev_c), abs(low - prev_c))
         trs.append(tr)
-    # Wilder smoothing
     atr = sum(trs[:period]) / period
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
@@ -563,11 +519,6 @@ def calc_atr(candles, period=14):
 
 
 def calc_bollinger(closes, period=20, std_dev=2.0):
-    """
-    Bollinger Bands: middle=SMA(20), upper/lower = ±2 std devs
-    Returns: (upper, middle, lower, bandwidth, is_expanding)
-    bandwidth = (upper-lower)/middle - wider = more volatile/expanding
-    """
     if len(closes) < period:
         return None, None, None, None, None
     window  = closes[-period:]
@@ -578,7 +529,6 @@ def calc_bollinger(closes, period=20, std_dev=2.0):
     lower   = round(middle - std_dev * std, 8)
     middle  = round(middle, 8)
     bandwidth = round((upper - lower) / middle * 100, 4) if middle > 0 else 0
-    # Compare to previous bandwidth to detect expansion
     if len(closes) >= period + 5:
         prev_window = closes[-(period+5):-5]
         prev_mid    = sum(prev_window) / period
@@ -592,10 +542,6 @@ def calc_bollinger(closes, period=20, std_dev=2.0):
 
 
 def calc_obv(closes, volumes):
-    """
-    OBV: cumulative volume - add on up days, subtract on down days
-    Returns: (current_obv, obv_trend) where trend is 'rising', 'falling', 'flat'
-    """
     if len(closes) < 2 or len(volumes) < 2:
         return None, None
     obv = 0.0
@@ -606,7 +552,6 @@ def calc_obv(closes, volumes):
         elif closes[i] < closes[i-1]:
             obv -= volumes[i]
         obv_history.append(obv)
-    # Trend: compare last 5 OBV values to previous 5
     if len(obv_history) >= 10:
         recent = sum(obv_history[-5:]) / 5
         prev   = sum(obv_history[-10:-5]) / 5
@@ -621,8 +566,122 @@ def calc_obv(closes, volumes):
     return round(obv, 2), trend
 
 
+def calc_adx(candles, period=14):
+    if len(candles) < period * 2:
+        return None
+    trs = [0]
+    plus_dms = [0]
+    minus_dms = [0]
+    for i in range(1, len(candles)):
+        high   = candles[i].get("high",  candles[i]["close"] * 1.005)
+        low    = candles[i].get("low",   candles[i]["close"] * 0.995)
+        prev_high = candles[i-1].get("high", candles[i-1]["close"] * 1.005)
+        prev_low  = candles[i-1].get("low",  candles[i-1]["close"] * 0.995)
+        prev_close = candles[i-1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        up_move   = high - prev_high
+        down_move = prev_low - low
+        plus_dm  = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+        plus_dms.append(plus_dm)
+        minus_dms.append(minus_dm)
+    tr_smooth = sum(trs[:period]) / period
+    plus_smooth = sum(plus_dms[:period]) / period
+    minus_smooth = sum(minus_dms[:period]) / period
+    dx_values = []
+    for i in range(period, len(trs)):
+        tr_smooth    = (tr_smooth * (period - 1) + trs[i]) / period
+        plus_smooth  = (plus_smooth * (period - 1) + plus_dms[i]) / period
+        minus_smooth = (minus_smooth * (period - 1) + minus_dms[i]) / period
+        pdi = (plus_smooth / tr_smooth) * 100 if tr_smooth > 0 else 0
+        mdi = (minus_smooth / tr_smooth) * 100 if tr_smooth > 0 else 0
+        total = pdi + mdi
+        dx_i = abs(pdi - mdi) / total * 100 if total > 0 else 0
+        dx_values.append(dx_i)
+    if not dx_values:
+        return None
+    adx = sum(dx_values[-period:]) / period
+    return round(adx, 2)
+
+
+def calc_stoch_rsi(closes, period=14, smooth_k=3, smooth_d=3):
+    """Stochastic RSI: returns (stoch_k, stoch_d, is_bullish) or None."""
+    if len(closes) < period + smooth_k + smooth_d:
+        return None, None, None
+    rsi_vals = []
+    for i in range(period, len(closes)):
+        r = calc_rsi(closes[i-period:i+1], period)
+        if r is not None:
+            rsi_vals.append(r)
+    if len(rsi_vals) < period + smooth_k:
+        return None, None, None
+    # %K raw
+    k_vals = []
+    for i in range(period, len(rsi_vals)):
+        window = rsi_vals[i-period:i]
+        min_r = min(window)
+        max_r = max(window)
+        if max_r == min_r:
+            k_vals.append(50.0)
+        else:
+            k_vals.append( ((rsi_vals[i] - min_r) / (max_r - min_r)) * 100 )
+    # Smooth %K
+    k_smooth = []
+    for i in range(smooth_k-1, len(k_vals)):
+        k_smooth.append(sum(k_vals[i-(smooth_k-1):i+1]) / smooth_k)
+    if len(k_smooth) < smooth_d:
+        return None, None, None
+    # %D = SMA of smoothed %K
+    d_vals = []
+    for i in range(smooth_d-1, len(k_smooth)):
+        d_vals.append(sum(k_smooth[i-(smooth_d-1):i+1]) / smooth_d)
+    stoch_k = k_smooth[-1]
+    stoch_d = d_vals[-1]
+    is_bullish = stoch_k > stoch_d
+    return round(stoch_k,2), round(stoch_d,2), is_bullish
+
+
+def calc_chaikin_money_flow(candles, period=20):
+    """Chaikin Money Flow: accumulation/distribution. Positive = buying pressure."""
+    if len(candles) < period:
+        return None
+    money_flow_vol = 0.0
+    total_vol = 0.0
+    for i in range(-period, 0):
+        c = candles[i]
+        high = c["high"]
+        low = c["low"]
+        close = c["close"]
+        vol = c["volume"]
+        if high == low:
+            mfm = 0
+        else:
+            mfm = ((close - low) - (high - close)) / (high - low)
+        money_flow_vol += mfm * vol
+        total_vol += vol
+    if total_vol == 0:
+        return 0.0
+    return round(money_flow_vol / total_vol, 4)
+
+
+def calc_rolling_vwap(candles, period=24):
+    """Rolling VWAP over last `period` candles (typical price)."""
+    if len(candles) < period:
+        return None
+    total_price_vol = 0.0
+    total_vol = 0.0
+    for c in candles[-period:]:
+        price = (c["high"] + c["low"] + c["close"]) / 3.0   # typical price
+        vol = c["volume"]
+        total_price_vol += price * vol
+        total_vol += vol
+    if total_vol == 0:
+        return None
+    return round(total_price_vol / total_vol, 8)
+
+
 def get_candles(symbol_usdt, interval="1h", limit=80):
-    """Fetch full OHLCV candles - now includes high/low for ATR."""
     try:
         r = session.get(
             "https://api.binance.com/api/v3/klines",
@@ -648,10 +707,7 @@ def get_candles(symbol_usdt, interval="1h", limit=80):
 
 
 def get_ta(symbol):
-    """
-    Full technical analysis - all 7 indicators:
-    RSI, EMA20/50, MACD, ATR, Bollinger Bands, OBV
-    """
+    """Full technical analysis with 10 indicators."""
     candles = get_candles(symbol + "USDT", "1h", 80)
     if not candles or len(candles) < 30:
         return None
@@ -667,25 +723,43 @@ def get_ta(symbol):
     atr_val, atr_pct                              = calc_atr(candles, 14)
     bb_upper, bb_mid, bb_lower, bb_bw, bb_expand = calc_bollinger(closes, 20)
     obv_val, obv_trend                            = calc_obv(closes, volumes)
+    adx_val                                       = calc_adx(candles, 14)
+
+    stoch_k, stoch_d, stoch_bull = calc_stoch_rsi(closes)
+    cmf = calc_chaikin_money_flow(candles, 20)
+    vwap = calc_rolling_vwap(candles, 24)
+
+    vol_profile_decay = False
+    if len(volumes) >= 13:
+        recent_avg = sum(volumes[-3:]) / 3
+        prev_avg   = sum(volumes[-13:-3]) / 10
+        if recent_avg < prev_avg * 0.95:
+            vol_profile_decay = True
 
     return {
         "rsi":          rsi,
         "ema20":        ema20,
         "ema50":        ema50,
         "vol_ratio":    vol_r,
-        # NEW indicators
         "macd":         macd_val,
         "macd_signal":  signal_val,
         "macd_hist":    histogram,
-        "macd_bullish": macd_bullish,   # True=bullish, False=bearish
+        "macd_bullish": macd_bullish,
         "atr":          atr_val,
-        "atr_pct":      atr_pct,        # ATR as % of price
+        "atr_pct":      atr_pct,
         "bb_upper":     bb_upper,
         "bb_lower":     bb_lower,
-        "bb_bw":        bb_bw,          # bandwidth %
-        "bb_expanding": bb_expand,      # True = expanding = real move
+        "bb_bw":        bb_bw,
+        "bb_expanding": bb_expand,
         "obv":          obv_val,
-        "obv_trend":    obv_trend,      # 'rising'/'falling'/'flat'
+        "obv_trend":    obv_trend,
+        "adx":          adx_val,
+        "stoch_k":      stoch_k,
+        "stoch_d":      stoch_d,
+        "stoch_bull":   stoch_bull,
+        "cmf":          cmf,
+        "vwap":         vwap,
+        "vol_profile_decay": vol_profile_decay,
     }
 
 
@@ -738,7 +812,7 @@ def get_prices():
                     }
             except Exception:
                 pass
-            time.sleep(0.02)   # 0.02s × 151 coins = 3s max fallback
+            time.sleep(0.02)
         return result if result else None
     except Exception as e:
         print("Binance fallback error:", e)
@@ -746,11 +820,9 @@ def get_prices():
 
 
 # ──────────────────────── SIGNAL ENGINE ───────────────────────
-# ATR minimum threshold - below this = flat/dead market = no trade
-ATR_MIN_PCT = 0.3   # 0.3% minimum ATR - skip signals in sleeping markets
+ATR_MIN_PCT = 0.3
+ADX_MIN     = 25
 
-# TP probability estimates based on historical hit rates
-# These are calibrated estimates - will improve over time
 TP_PROB = {
     "tp1": {"high": 91, "med": 85, "low": 78},
     "tp2": {"high": 82, "med": 74, "low": 65},
@@ -758,61 +830,67 @@ TP_PROB = {
 
 
 def calc_tp_probability(conf, vol_ratio, macd_bullish, bb_expanding):
-    """
-    Estimate TP1 and TP2 hit probability based on signal strength.
-    More confirmations = higher probability.
-    """
-    # Base from confidence score
     if conf >= 92:    base = "high"
     elif conf >= 87:  base = "med"
     else:             base = "low"
-
     tp1_prob = TP_PROB["tp1"][base]
     tp2_prob = TP_PROB["tp2"][base]
-
-    # Bonus for extra confirmations
     bonus = 0
     if vol_ratio and vol_ratio > 2:   bonus += 2
     if macd_bullish is not None:       bonus += 2
     if bb_expanding:                   bonus += 1
-
     tp1_prob = min(96, tp1_prob + bonus)
     tp2_prob = min(90, tp2_prob + bonus)
     return tp1_prob, tp2_prob
 
 
-def calc_levels(price, direction, rsi, vol_ratio, atr_pct=None):
-    """
-    Calculate TP1-4 and SL.
-    SL is now ATR-based (dynamic) when ATR data available.
-    Fixed % fallback when ATR not available.
-    """
-    base = 0.025
-    if vol_ratio and vol_ratio > 3:       base = 0.042
-    elif vol_ratio and vol_ratio > 2:     base = 0.034
-    elif rsi is not None and (rsi < 25 or rsi > 75): base = 0.036
-
-    if direction == "BUY":
-        tp1 = round(price * (1 + base * 0.40), 8)
-        tp2 = round(price * (1 + base * 0.70), 8)
-        tp3 = round(price * (1 + base * 1.00), 8)
-        tp4 = round(price * (1 + base * 1.50), 8)
-        # ATR SL: use 2× ATR if available, else fixed 1.0%
-        if atr_pct and atr_pct > 0:
-            sl_pct = min(max(atr_pct * 2, 0.4), 1.5)  # clamp 0.4%-1.5%
+def calc_levels(price, direction, rsi, vol_ratio, atr_pct=None, atr_val=None):
+    if atr_val is not None and atr_val > 0 and price > 0:
+        if direction == "BUY":
+            tp1 = round(price + 1.5 * atr_val, 8)
+            tp2 = round(price + 2.5 * atr_val, 8)
+            tp3 = round(price + 4.0 * atr_val, 8)
+            tp4 = round(price + 6.0 * atr_val, 8)
+            sl  = round(price - 2.0 * atr_val, 8)
         else:
-            sl_pct = 1.0
-        sl = round(price * (1 - sl_pct / 100), 8)
+            tp1 = round(price - 1.5 * atr_val, 8)
+            tp2 = round(price - 2.5 * atr_val, 8)
+            tp3 = round(price - 4.0 * atr_val, 8)
+            tp4 = round(price - 6.0 * atr_val, 8)
+            sl  = round(price + 2.0 * atr_val, 8)
+        # Cap stop-loss distance
+        max_sl_dist = MAX_SL_PCT * price
+        if abs(sl - price) > max_sl_dist:
+            if direction == "BUY":
+                sl = round(price - max_sl_dist, 8)
+            else:
+                sl = round(price + max_sl_dist, 8)
     else:
-        tp1 = round(price * (1 - base * 0.40), 8)
-        tp2 = round(price * (1 - base * 0.70), 8)
-        tp3 = round(price * (1 - base * 1.00), 8)
-        tp4 = round(price * (1 - base * 1.50), 8)
-        if atr_pct and atr_pct > 0:
-            sl_pct = min(max(atr_pct * 2, 0.4), 1.5)
+        # Fixed % fallback
+        base = 0.025
+        if vol_ratio and vol_ratio > 3:       base = 0.042
+        elif vol_ratio and vol_ratio > 2:     base = 0.034
+        elif rsi is not None and (rsi < 25 or rsi > 75): base = 0.036
+        if direction == "BUY":
+            tp1 = round(price * (1 + base * 0.40), 8)
+            tp2 = round(price * (1 + base * 0.70), 8)
+            tp3 = round(price * (1 + base * 1.00), 8)
+            tp4 = round(price * (1 + base * 1.50), 8)
+            if atr_pct and atr_pct > 0:
+                sl_pct = min(max(atr_pct * 2, 0.4), 1.5)
+            else:
+                sl_pct = 1.0
+            sl = round(price * (1 - sl_pct / 100), 8)
         else:
-            sl_pct = 1.0
-        sl = round(price * (1 + sl_pct / 100), 8)
+            tp1 = round(price * (1 - base * 0.40), 8)
+            tp2 = round(price * (1 - base * 0.70), 8)
+            tp3 = round(price * (1 - base * 1.00), 8)
+            tp4 = round(price * (1 - base * 1.50), 8)
+            if atr_pct and atr_pct > 0:
+                sl_pct = min(max(atr_pct * 2, 0.4), 1.5)
+            else:
+                sl_pct = 1.0
+            sl = round(price * (1 + sl_pct / 100), 8)
 
     tp_pcts = [
         round(abs(tp1 - price) / price * 100, 2),
@@ -828,11 +906,6 @@ def calc_levels(price, direction, rsi, vol_ratio, atr_pct=None):
 
 
 def build_signal(price, change, high, low, vol, ta):
-    """
-    APEX v3 Signal Engine - 7 indicator filters:
-    RSI + EMA + Volume + MACD + ATR + Bollinger + OBV
-    ALL must confirm before signal fires.
-    """
     if not price:
         return None
 
@@ -874,29 +947,38 @@ def build_signal(price, change, high, low, vol, ta):
     macd_bullish = (ta or {}).get("macd_bullish")
     macd_hist    = (ta or {}).get("macd_hist")
     atr_pct      = (ta or {}).get("atr_pct")
+    atr_val      = (ta or {}).get("atr")
     bb_expanding = (ta or {}).get("bb_expanding")
     bb_bw        = (ta or {}).get("bb_bw")
     obv_trend    = (ta or {}).get("obv_trend")
+    adx          = (ta or {}).get("adx")
+    stoch_k      = (ta or {}).get("stoch_k")
+    stoch_d      = (ta or {}).get("stoch_d")
+    stoch_bull   = (ta or {}).get("stoch_bull")
+    cmf          = (ta or {}).get("cmf")
+    vwap         = (ta or {}).get("vwap")
+    vol_profile_decay = (ta or {}).get("vol_profile_decay", False)
 
-    # ── 4. ATR flat market filter ──
-    # If market is sleeping (ATR too low) → skip entirely
+    # ── ADX trend filter ──
+    if adx is not None and adx < ADX_MIN:
+        return None
+
+    # ── ATR flat market filter ──
     if atr_pct is not None and atr_pct < ATR_MIN_PCT:
         return None
 
-    # ── 4b. ATR extreme volatility filter (Phase 1) ──
-    # Block coins with ATR > 8% - too volatile, SL gaps to liquidation
-    # WAVES=26%, HNT=17%, EOS=17% all liquidated us - this stops it
+    # ── ATR extreme volatility filter ──
     ATR_MAX_PCT = 8.0
     if atr_pct is not None and atr_pct > ATR_MAX_PCT:
         return None
 
-    # ── 5. RSI hard veto ──
+    # ── RSI hard veto ──
     if score > 0 and rsi is not None and rsi > 75:
         return None
     if score < 0 and rsi is not None and rsi < 25:
         return None
 
-    # ── 6. RSI confirmation ──
+    # ── RSI confirmation ──
     if score > 0 and rsi is not None:
         if rsi < 40:   score += 2
         elif rsi < 50: score += 1
@@ -904,39 +986,60 @@ def build_signal(price, change, high, low, vol, ta):
         if rsi > 60:   score -= 2
         elif rsi > 50: score -= 1
 
-    # ── 7. EMA trend ──
+    # ── EMA trend ──
     if ema20 is not None and ema50 is not None:
         if score > 0 and ema20 > ema50: score += 1
         if score < 0 and ema20 < ema50: score -= 1
 
-    # ── 8. Volume spike bonus ──
+    # ── Volume spike bonus ──
     if vol_ratio and vol_ratio > 3:
         score = score + 2 if score > 0 else score - 2
     elif vol_ratio and vol_ratio > 2:
         score = score + 1 if score > 0 else score - 1
 
-    # ── 9. MACD confirmation (NEW) ──
-    if macd_bullish is not None:
-        if score > 0 and macd_bullish:      score += 2  # bullish cross = BUY confirmed
-        elif score > 0 and not macd_bullish: score -= 1  # MACD bearish = weaken BUY
-        if score < 0 and not macd_bullish:  score -= 2  # bearish cross = SELL confirmed
-        elif score < 0 and macd_bullish:    score += 1  # MACD bullish = weaken SELL
+    # ── Volume profile decay penalty ──
+    if vol_profile_decay:
+        score = score - 5 if score > 0 else score + 5
 
-    # ── 10. Bollinger Bands expansion (NEW) ──
+    # ── MACD confirmation ──
+    if macd_bullish is not None:
+        if score > 0 and macd_bullish:      score += 2
+        elif score > 0 and not macd_bullish: score -= 1
+        if score < 0 and not macd_bullish:  score -= 2
+        elif score < 0 and macd_bullish:    score += 1
+
+    # ── Bollinger Bands expansion ──
     if bb_expanding is not None:
         if bb_expanding:
-            score = score + 1 if score > 0 else score - 1   # expanding = real move
+            score = score + 1 if score > 0 else score - 1
         else:
-            score = score - 1 if score > 0 else score + 1   # contracting = fake move
+            score = score - 1 if score > 0 else score + 1
 
-    # ── 11. OBV trend confirmation (NEW) ──
+    # ── OBV trend confirmation ──
     if obv_trend:
-        if score > 0 and obv_trend == "rising":   score += 1  # real buying
-        elif score > 0 and obv_trend == "falling": score -= 2  # fake pump
-        if score < 0 and obv_trend == "falling":  score -= 1  # real selling
-        elif score < 0 and obv_trend == "rising":  score += 2  # fake dump
+        if score > 0 and obv_trend == "rising":   score += 1
+        elif score > 0 and obv_trend == "falling": score -= 2
+        if score < 0 and obv_trend == "falling":  score -= 1
+        elif score < 0 and obv_trend == "rising":  score += 2
 
-    # ── 12. Score → direction + confidence ──
+    # ── StochRSI hard filter ──
+    if stoch_k is not None and stoch_d is not None:
+        if score > 0 and stoch_k > 80:   return None
+        if score < 0 and stoch_k < 20:   return None
+        if score > 0 and stoch_bull:      score += 1
+        if score < 0 and not stoch_bull:  score -= 1  # FIXED: strengthen SHORT
+
+    # ── CMF accumulation/distribution filter ──
+    if cmf is not None:
+        if score > 0 and cmf < 0:   return None
+        if score < 0 and cmf > 0:   return None
+
+    # ── VWAP institutional filter ──
+    if vwap is not None:
+        if score > 0 and price < vwap:   return None
+        if score < 0 and price > vwap:   return None
+
+    # ── Score → direction + confidence ──
     if score >= 7:
         conf = min(95, 70 + score * 3);      direction = "BUY"
     elif score >= 5:
@@ -948,28 +1051,67 @@ def build_signal(price, change, high, low, vol, ta):
     else:
         return None
 
-    levels   = calc_levels(price, direction, rsi, vol_ratio, atr_pct)
-    tp1_prob, tp2_prob = calc_tp_probability(
-        conf, vol_ratio, macd_bullish, bb_expanding
-    )
+    # ── Indicator consensus (now 10 indicators, threshold 5) ──
+    agreements = 0
+    # 1. RSI
+    if direction == "BUY" and rsi is not None and rsi < 60:   agreements += 1
+    if direction == "SELL" and rsi is not None and rsi > 40:  agreements += 1
+    # 2. EMA
+    if ema20 is not None and ema50 is not None:
+        if direction == "BUY" and ema20 > ema50:    agreements += 1
+        if direction == "SELL" and ema20 < ema50:   agreements += 1
+    # 3. MACD
+    if macd_bullish is not None:
+        if direction == "BUY" and macd_bullish:     agreements += 1
+        if direction == "SELL" and not macd_bullish: agreements += 1
+    # 4. Volume ratio > 1.2
+    if vol_ratio is not None and vol_ratio > 1.2:   agreements += 1
+    # 5. ATR > 0.3%
+    if atr_pct is not None and atr_pct > 0.3:       agreements += 1
+    # 6. Bollinger expanding
+    if bb_expanding is True:                         agreements += 1
+    # 7. OBV trend
+    if obv_trend == "rising" and direction == "BUY":     agreements += 1
+    if obv_trend == "falling" and direction == "SELL":   agreements += 1
+    # 8. StochRSI bull
+    if stoch_bull is not None:
+        if direction == "BUY" and stoch_bull:        agreements += 1
+        if direction == "SELL" and not stoch_bull:   agreements += 1
+    # 9. CMF
+    if cmf is not None:
+        if direction == "BUY" and cmf > 0:           agreements += 1
+        if direction == "SELL" and cmf < 0:          agreements += 1
+    # 10. VWAP
+    if vwap is not None:
+        if direction == "BUY" and price > vwap:      agreements += 1
+        if direction == "SELL" and price < vwap:     agreements += 1
+
+    if agreements < 5:
+        return None
+
+    levels   = calc_levels(price, direction, rsi, vol_ratio, atr_pct, atr_val)
+    tp1_prob, tp2_prob = calc_tp_probability(conf, vol_ratio, macd_bullish, bb_expanding)
 
     return {
         "signal":       direction,
         "conf":         conf,
         "score":        score,
-        # Original indicators
         "rsi":          rsi,
         "ema20":        ema20,
         "ema50":        ema50,
         "vol_ratio":    vol_ratio,
-        # New indicators
         "macd_bullish": macd_bullish,
         "macd_hist":    macd_hist,
         "atr_pct":      atr_pct,
         "bb_expanding": bb_expanding,
         "bb_bw":        bb_bw,
         "obv_trend":    obv_trend,
-        # Levels
+        "adx":          adx,               # included for Telegram signal message
+        "stoch_k":      stoch_k,           # included
+        "stoch_d":      stoch_d,           # included
+        "stoch_bull":   stoch_bull,        # included
+        "cmf":          cmf,               # included
+        "vwap":         vwap,              # included
         "tp1":          levels["tp1"],
         "tp2":          levels["tp2"],
         "tp3":          levels["tp3"],
@@ -977,7 +1119,6 @@ def build_signal(price, change, high, low, vol, ta):
         "sl":           levels["sl"],
         "sl_pct":       levels["sl_pct"],
         "tp_pcts":      levels["tp_pcts"],
-        # Probability
         "tp1_prob":     tp1_prob,
         "tp2_prob":     tp2_prob,
     }
@@ -1001,7 +1142,7 @@ def get_data():
         open_pos = {}
         for sym, pos in positions.items():
             realized   = pos.get("currentPnl", 0)
-            unrealized = pos.get("unrealized_pnl", 0)   # updated live by monitor loop
+            unrealized = pos.get("unrealized_pnl", 0)
             rem_pct    = 1.0 - (pos.get("tp_hit", 0) * 0.25)
             open_pos[sym] = {
                 "sym":           sym,
@@ -1025,7 +1166,6 @@ def get_data():
                 "sigId":         pos.get("sig_id", ""),
             }
 
-        # Cap pnl_history at 500 points to prevent unbounded memory growth
         pnl_hist = stats["pnl_history"][-500:]
 
         payload = {
@@ -1053,7 +1193,6 @@ def get_data():
 
 
 def start_flask():
-    # FIX: suppress Flask/werkzeug development server warning
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     port = int(os.environ.get("PORT", 8080))
@@ -1100,7 +1239,6 @@ def tg_updates(offset=None):
 
 
 def make_report():
-    """Generate a full session report on demand."""
     with state_lock:
         total      = stats["total"]
         trades_won = stats["trades_won"]
@@ -1113,7 +1251,6 @@ def make_report():
         total_cap  = round(free_cash + deployed, 2)
         open_count = len(positions)
 
-        # Build open positions summary
         pos_lines = []
         for sym, pos in positions.items():
             direction  = pos.get("direction", "")
@@ -1158,7 +1295,6 @@ def check_btns(offset):
     if updates and updates.get("ok"):
         for u in updates.get("result", []):
             offset = u["update_id"] + 1
-            # Handle text commands from user
             msg  = (u.get("message") or u.get("channel_post") or {})
             text = msg.get("text", "").strip().lower()
             if text in ("/report", "/status", "/r"):
@@ -1197,13 +1333,11 @@ def make_pre_warn(coin, direction, price):
 
 
 def make_signal_id(sym):
-    """Generate a short unique signal ID e.g. SOL-0417-1423"""
     now = datetime.now(timezone.utc)
     return f"{sym}-{now.strftime('%m%d')}-{now.strftime('%H%M')}"
 
 
 def tp_progress_bar(tp_hit, direction):
-    """Visual TP progress - e.g. TP1✅ TP2✅ TP3⬜ TP4⬜"""
     icons = []
     for i in range(1, 5):
         if i <= tp_hit:
@@ -1243,6 +1377,12 @@ def make_signal_msg(coin, sig, price, change):
     obv_str  = ("✅ Rising" if obv_trend == "rising" else
                 "⚠️ Falling" if obv_trend == "falling" else "➡️ Flat") if obv_trend else "N/A"
 
+    # NEW indicators for review
+    stoch_str = f"K={sig.get('stoch_k','?'):.1f} D={sig.get('stoch_d','?'):.1f}" \
+                if sig.get("stoch_k") is not None else "N/A"
+    cmf_str   = f"{sig.get('cmf','?'):.2f}" if sig.get("cmf") is not None else "N/A"
+    vwap_str  = fmt_p(sig.get("vwap")) if sig.get("vwap") is not None else "N/A"
+
     lev_ret      = [round(p * LEVERAGE, 1) for p in tp_pcts]
     trade_size   = calc_trade_size()
     notional     = trade_size * LEVERAGE
@@ -1265,7 +1405,11 @@ def make_signal_msg(coin, sig, price, change):
         f"BB:       {bb_str}\n"
         f"OBV:      {obv_str}\n"
         f"ATR:      {atr_str}\n"
-        f"Volume:   {vol_str}\n"
+        f"ADX:      {sig.get('adx','?') if sig.get('adx') is not None else 'N/A'}\n"
+        f"StochRSI: {stoch_str}\n"
+        f"CMF:      {cmf_str}\n"
+        f"VWAP:     {vwap_str}\n"
+        f"Volume:   {vol_str} (24h)\n"
         f"24h:      {sign}{round(change, 2)}%\n\n"
         f"Confidence: {conf}%  [{bars}]\n\n"
         f"🤖 <i>Paper trade auto-entered</i>\n"
@@ -1347,39 +1491,22 @@ def make_sl_msg(sym, direction, entry, exec_price, sl_price, elapsed, pnl_usdt, 
 
 
 # ──────────────────────── PAPER EXECUTE ───────────────────────
-# ─────────────────── PHASE 1 HELPER FUNCTIONS ────────────────
 def is_sl_hit(direction, price, sl):
-    """Returns True if current price has reached the stop-loss."""
     if direction == "BUY":
         return price <= sl
     return price >= sl
 
 
-def is_liq_hit(direction, price, liq_price):
-    """Returns True if current price has reached the liquidation price."""
-    if direction == "BUY":
-        return price <= liq_price
-    return price >= liq_price
-
-
 def is_sl_safe(direction, sl, liq_price):
-    """
-    Returns True if SL is safely before the liquidation price.
-    Requires LIQ_BUFFER_PCT (2%) gap between SL and liquidation.
-    Prevents trades where SL is so close to liq that any gap causes liquidation.
-    """
     if liq_price <= 0 or sl <= 0:
         return False
     if direction == "BUY":
-        # SL must be at least LIQ_BUFFER_PCT above liq price
         return sl >= liq_price * (1 + LIQ_BUFFER_PCT)
     else:
-        # SL must be at least LIQ_BUFFER_PCT below liq price
         return sl <= liq_price * (1 - LIQ_BUFFER_PCT)
 
 
 def paper_execute(coin, sig, price):
-    """Simulate opening a leveraged position instantly."""
     global paper_balance
     sym        = coin["symbol"]
     direction  = sig["signal"]
@@ -1398,25 +1525,20 @@ def paper_execute(coin, sig, price):
     else:
         liq_price = round(exec_price * (1 + 0.9 / LEVERAGE), 8)
 
-    # ── Phase 1: Reject if SL is not safely before liquidation ──
     if not is_sl_safe(direction, sig["sl"], liq_price):
         print(f"  ⛔ SL unsafe - SL={sig['sl']:.6f} Liq={liq_price:.6f} - rejected")
         return False
 
-    # All state mutations under lock; TG calls outside to avoid holding lock during HTTP
     with state_lock:
-        # ── Hard cap - safety net in case scan loop check is bypassed ──
         if len(positions) >= MAX_OPEN_TRADES:
             print(f"  ⛔ Max trades reached inside execute: {len(positions)}/{MAX_OPEN_TRADES}")
             return False
 
-        # ── Phase 1: Direction correlation cap ──
         same_dir = sum(1 for p in positions.values() if p.get("direction") == direction)
         if same_dir >= MAX_SAME_DIRECTION:
             print(f"  ⛔ Direction cap: already {same_dir} {direction}s open (max {MAX_SAME_DIRECTION})")
             return False
 
-        # ── Phase 1: Minimum free cash check (40%) ──
         total_cap = paper_balance + sum(
             p.get("margin", 0) * (1 - p.get("tp_hit", 0) * 0.25)
             for p in positions.values())
@@ -1453,12 +1575,11 @@ def paper_execute(coin, sig, price):
                 "currentPnl":              0.0,
                 "unrealized_pnl":          0.0,
                 "sig_id":                  sig_id,
-                "close_reason":            None,  # Phase 1: track close reason
+                "close_reason":            None,
             }
             bal_after  = paper_balance
             open_count = len(positions)
 
-    # Send TG outside lock - no HTTP while holding state_lock
     if bal_snap is not None:
         tg_send(
             f"<b>⚠️ Paper balance too low - {sym}</b>\n\n"
@@ -1494,14 +1615,9 @@ def paper_execute(coin, sig, price):
 
 # ──────────────────────── POSITION MONITOR ────────────────────
 def monitor_positions(prices):
-    """
-    FIX: Collect all notifications in a list, send AFTER releasing lock.
-    This prevents holding state_lock during slow HTTP calls to Telegram,
-    keeping the Flask /data endpoint responsive.
-    """
     global paper_balance
     to_remove     = []
-    notifications = []   # (msg_str,) - built inside lock, sent outside
+    notifications = []
 
     for sym, pos in list(positions.items()):
         coin_data = next((c for c in COINS if c["symbol"] == sym), None)
@@ -1515,7 +1631,6 @@ def monitor_positions(prices):
             continue
 
         with state_lock:
-            # Read all pos fields inside lock - prevents race with /data endpoint
             direction  = pos.get("direction", "BUY")
             entry      = pos.get("entry", 0)
             exec_price = pos.get("exec_price", 0)
@@ -1527,7 +1642,6 @@ def monitor_positions(prices):
                           pos.get("tp3",0), pos.get("tp4",0)]
             trade_size = pos.get("margin", float(TRADE_SIZE))
 
-            # ── Live unrealized PnL - updated every monitor cycle ──
             remaining_pct = 1.0 - (tp_hit * 0.25)
             if exec_price > 0:
                 if direction == "BUY":
@@ -1538,7 +1652,6 @@ def monitor_positions(prices):
                     trade_size * LEVERAGE * live_move_pct / 100 * remaining_pct, 2
                 )
 
-            # ── Funding deduction every 8 hours ──
             funding_due = int(elapsed / 28800)
             new_periods = funding_due - pos.get("funding_periods_charged", 0)
             if new_periods > 0:
@@ -1549,7 +1662,7 @@ def monitor_positions(prices):
                 stats["pnl_history"].append(round(paper_balance, 2))
                 print(f"  💸 Funding: {sym} -${funding_cost:.4f} ({new_periods} period(s))")
 
-            # ── SL check FIRST (always before liquidation per Phase 1) ──
+            # Stop-loss check
             if is_sl_hit(direction, price, sl):
                 rem_pct          = 1.0 - (tp_hit * 0.25)
                 price_move       = abs(sl - exec_price) / exec_price * 100
@@ -1588,44 +1701,7 @@ def monitor_positions(prices):
                 to_remove.append(sym)
                 continue
 
-            # ── Liquidation check SECOND ──
-            # SL was NOT hit above, so if liq is hit the price gapped
-            # straight through SL → treat as GAP_SL, fill at SL + GAP_SLIPPAGE_PCT
-            if is_liq_hit(direction, price, liq_price):
-                rem_pct          = 1.0 - (tp_hit * 0.25)
-                remaining_margin = trade_size * rem_pct
-                if direction == "BUY":
-                    gap_close_price = sl * (1 - GAP_SLIPPAGE_PCT)
-                else:
-                    gap_close_price = sl * (1 + GAP_SLIPPAGE_PCT)
-                price_move  = abs(gap_close_price - exec_price) / exec_price * 100
-                pnl_usdt    = round(trade_size * LEVERAGE * price_move / 100 * rem_pct, 2)
-                stats["loss_usdt"] += pnl_usdt
-                paper_balance      += max(0, remaining_margin - pnl_usdt)
-                stats["total"]     += 1
-                stats["sl_hit"]    += 1
-                risk_state["consec_losses"] += 1
-                stats["pnl_history"].append(round(paper_balance, 2))
-                stats["trades_list"].append({
-                    "sym": sym, "direction": direction,
-                    "result": "GAP_SL", "close_reason": "GAP_SL",
-                    "pnl": -pnl_usdt, "time": utc_now_str(),
-                })
-                notifications.append(
-                    f"<b>⚠️ GAP SL - {sym}</b> (price gapped past SL to liq)\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 #{pos.get('sig_id','?')}  |  Entry: {fmt_p(entry)}\n"
-                    f"{tp_progress_bar(tp_hit, direction)}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"SL: {fmt_p(sl)}  →  Gap fill: {fmt_p(gap_close_price)}\n"
-                    f"Loss: -${pnl_usdt:.2f} USDT (capped at SL, NOT full liq)\n\n"
-                    f"Balance: ${paper_balance:.2f} USDT"
-                )
-                print(f"  ⚠️ GAP SL: {sym} - skipped SL {sl:.5f}, hit liq {liq_price:.5f}")
-                to_remove.append(sym)
-                continue
-
-            # ── TP check ──
+            # Take-profit check
             if tp_hit >= 4:
                 to_remove.append(sym)
                 continue
@@ -1646,11 +1722,9 @@ def monitor_positions(prices):
                 stats["pnl_history"].append(round(paper_balance, 2))
                 pos["currentPnl"]     = pos.get("currentPnl", 0) + pnl_usdt
 
-                # Mark first TP hit (used to set breakeven SL)
                 if not pos["first_tp_counted"]:
                     pos["first_tp_counted"] = True
 
-                # Trail SL
                 new_sl = None
                 if tp_num == 1 and not pos.get("breakeven"):
                     new_sl           = exec_price
@@ -1667,8 +1741,8 @@ def monitor_positions(prices):
 
                 if tp_num == 4:
                     stats["total"]              += 1
-                    stats["trades_won"]          += 1   # all 4 TPs = definite win
-                    risk_state["consec_losses"]   = 0   # reset streak
+                    stats["trades_won"]          += 1
+                    risk_state["consec_losses"]   = 0
                     stats["trades_list"].append({
                         "sym": sym, "direction": direction, "result": "ALL_TP",
                         "pnl": round(pos["currentPnl"], 2), "time": utc_now_str(),
@@ -1703,24 +1777,83 @@ def monitor_positions(prices):
                     )
                     print(f"  TP{tp_num} hit: {sym} @ ${price}")
 
-        # End of with state_lock
-
-    # Cleanup positions
     with state_lock:
         for sym in to_remove:
             positions.pop(sym, None)
 
-    # FIX: send all notifications OUTSIDE the lock - no HTTP while holding state_lock
     for msg in notifications:
         tg_send(msg)
 
 
 # ─────────────────────────── MAIN ─────────────────────────────
+def close_stale_position(sym, pos, scan_prices):
+    """Close a stale position using current live price and book accurate P&L."""
+    global paper_balance
+    coin_data = next((c for c in COINS if c["symbol"] == sym), None)
+    if not coin_data:
+        return
+    d = scan_prices.get(coin_data["id"]) or {}
+    live_price = d.get("usd")
+    if not live_price:
+        live_price = pos.get("exec_price", 0)
+
+    with state_lock:
+        if sym not in positions:
+            return
+        pos = positions[sym]
+        direction  = pos["direction"]
+        exec_price = pos["exec_price"]
+        tp_hit     = pos["tp_hit"]
+        rem_pct    = 1.0 - (tp_hit * 0.25)
+        trade_size = pos["margin"]
+        remaining_margin = trade_size * rem_pct
+
+        # Calculate unrealized P&L on the remaining position only
+        if exec_price > 0:
+            if direction == "BUY":
+                move_pct = (live_price - exec_price) / exec_price * 100
+            else:
+                move_pct = (exec_price - live_price) / exec_price * 100
+            unrealized_pnl = round(trade_size * LEVERAGE * move_pct / 100 * rem_pct, 2)
+        else:
+            unrealized_pnl = 0.0
+
+        prior_realized = pos.get("currentPnl", 0)
+        total_trade_pnl = round(prior_realized + unrealized_pnl, 2)
+
+        # Only add unrealized part to stats (prior TP profits already counted)
+        if unrealized_pnl >= 0:
+            stats["profit_usdt"] += unrealized_pnl
+        else:
+            stats["loss_usdt"] += abs(unrealized_pnl)
+
+        # Return remaining margin + unrealized profit/loss
+        paper_balance += remaining_margin + unrealized_pnl
+
+        stats["total"] += 1
+        stats["trades_list"].append({
+            "sym": sym,
+            "direction": direction,
+            "result": "STALE_CLOSE",
+            "pnl": total_trade_pnl,
+            "time": utc_now_str(),
+        })
+        positions.pop(sym, None)
+
+        age_h = (time.time() - pos["opened_at"]) / 3600
+        sign  = "+" if total_trade_pnl >= 0 else ""
+        tg_send(
+            f"<b>⏰ STALE TRADE CLOSED - {sym}</b>\n"
+            f"Position open: {age_h:.1f}h (max {MAX_TRADE_HOURS}h)\n"
+            f"Final price: {fmt_p(live_price)}\n"
+            f"Trade P&L: {sign}${total_trade_pnl:.2f}\n"
+            f"Balance: ${paper_balance:.2f}"
+        )
+
+
 def run():
-    # FIX: declare all mutable globals so pruning updates the real objects
     global paper_balance, pre_warned, last_signal
 
-    # Reset session start balance for daily loss tracking
     risk_state["session_start_balance"] = paper_balance
     risk_state["btc_last_check"]        = time.time()
 
@@ -1747,11 +1880,10 @@ def run():
         f"Min confidence: <b>{MIN_CONF}%</b>\n"
         f"Blocked coins: <b>{len(BLOCKED_COINS)}</b>\n\n"
         f"<b>🔧 Phase 1 Fixes Active:</b>\n"
-        f"• GAP SL - gaps fill at SL price, not liquidation\n"
         f"• ATR cap - blocks coins with ATR > 8% (no more WAVES/HNT)\n"
         f"• Direction cap - max {MAX_SAME_DIRECTION} per side (no all-SHORT cascades)\n"
         f"• Free cash floor - {MIN_FREE_CASH_PCT*100:.0f}% always reserved\n"
-        f"• Smaller size - ${TRADE_SIZE:.0f} (was $200) | Fewer trades - {MAX_OPEN_TRADES} (was 8)\n\n"
+        f"• Smaller size - ${TRADE_SIZE:.0f} (was $200) | More trades - {MAX_OPEN_TRADES} (was 6)\n\n"
         f"<b>🛡️ Risk:</b> {MAX_DAILY_LOSS_PCT*100:.0f}% daily loss | {MAX_CONSEC_LOSSES} consec SL | {MAX_TRADE_HOURS}h max age\n\n"
         f"<b>📊 Commands:</b> /report /r /pause /resume /help\n\n"
         f"<i>Paper mode - collecting clean data for Phase 2</i>"
@@ -1776,7 +1908,6 @@ def run():
                 if open_syms:
                     monitor_positions(prices)
 
-            # ── SCAN ──
             if time.time() - last_scan_at >= SCAN_EVERY_SECONDS:
                 last_scan_at = time.time()
 
@@ -1790,47 +1921,16 @@ def run():
                     f"(open: {open_count}, balance: ${balance:.2f})"
                 )
 
-                # FIX: declare all mutable globals so pruning updates the real objects
                 now = time.time()
                 pre_warned  = {k: v for k, v in pre_warned.items()  if now - v < PRE_WARN_TTL}
-                # Keep last_signal only for coins currently being watched (in COINS list)
                 coin_syms   = {c["symbol"] for c in COINS}
                 last_signal = {k: v for k, v in last_signal.items() if k in coin_syms}
-                # FIX: trim pnl_history in-place so RAM never grows unbounded
-                if len(stats["pnl_history"]) > 600:
-                    stats["pnl_history"] = stats["pnl_history"][-500:]
 
-                # ── Check for stale positions (open > MAX_TRADE_HOURS) ──
-                stale_syms = check_stale_positions()
-                for sym in stale_syms:
-                    stale_msg = None
-                    with state_lock:
-                        pos = positions.get(sym)
-                        if not pos:
-                            continue
-                        age_h     = (time.time() - pos.get("opened_at", time.time())) / 3600
-                        rem_pct   = 1.0 - (pos.get("tp_hit", 0) * 0.25)
-                        pnl_snap  = pos.get("currentPnl", 0)
-                        paper_balance += pos.get("margin", TRADE_SIZE) * rem_pct
-                        stats["total"]      += 1
-                        stats["trades_list"].append({
-                            "sym": sym, "direction": pos.get("direction",""),
-                            "result": "STALE_CLOSE",
-                            "pnl": round(pnl_snap, 2),
-                            "time": utc_now_str(),
-                        })
-                        positions.pop(sym, None)
-                        # Build message inside lock (reads balance), send outside
-                        stale_msg = (
-                            f"<b>⏰ STALE TRADE CLOSED - {sym}</b>\n\n"
-                            f"Position open for {age_h:.1f}h (max {MAX_TRADE_HOURS}h)\n"
-                            f"Realised P&L: +${pnl_snap:.2f} USDT\n\n"
-                            f"<i>Auto-closed to free capital.</i>"
-                        )
-                    # Send TG outside lock - no HTTP while holding state_lock
-                    if stale_msg:
-                        tg_send(stale_msg)
+                with state_lock:
+                    if len(stats["pnl_history"]) > 600:
+                        stats["pnl_history"] = stats["pnl_history"][-500:]
 
+                # Fetch fresh prices first
                 scan_prices = get_prices()
                 if not scan_prices:
                     time.sleep(2)
@@ -1838,7 +1938,14 @@ def run():
 
                 prices = scan_prices
 
-                # ── Circuit breaker check ──
+                # Stale trade closure using live prices
+                stale_syms = check_stale_positions()
+                for sym in stale_syms:
+                    pos_snapshot = positions.get(sym)
+                    if pos_snapshot:
+                        close_stale_position(sym, pos_snapshot, scan_prices)
+
+                # Circuit breaker check (after stale close to release capital)
                 paused = check_circuit_breakers(scan_prices)
                 if paused:
                     print(f"  🛑 Trading paused: {risk_state['pause_reason']}")
@@ -1878,7 +1985,6 @@ def run():
                     if not price or abs(change) < 2:
                         continue
 
-                    # ── Phase 1: Volume filter - skip low liquidity coins ──
                     if not vol or vol < MIN_24H_VOLUME:
                         continue
 
@@ -1886,13 +1992,17 @@ def run():
 
                     ta = ta_map.get(sym)
                     if ta:
-                        trend    = "↑" if ta.get("ema20") and ta.get("ema50") and ta["ema20"] > ta["ema50"] else "↓"
-                        macd_c   = "M✅" if ta.get("macd_bullish") else "M⚠️"
-                        bb_c     = "BB✅" if ta.get("bb_expanding") else "BB⚠️"
-                        obv_c    = "OBV✅" if ta.get("obv_trend") == "rising" else "OBV⚠️"
-                        atr_val  = ta.get("atr_pct")
-                        atr_c    = f"ATR={atr_val:.2f}%" if atr_val is not None else "ATR=N/A"
-                        print(f" | RSI={ta.get('rsi','?')} EMA={trend} {macd_c} {bb_c} {obv_c} {atr_c}", end="")
+                        trend   = "↑" if ta.get("ema20") and ta.get("ema50") and ta["ema20"] > ta["ema50"] else "↓"
+                        macd_c  = "M✅" if ta.get("macd_bullish") else "M⚠️"
+                        bb_c    = "BB✅" if ta.get("bb_expanding") else "BB⚠️"
+                        obv_c   = "OBV✅" if ta.get("obv_trend") == "rising" else "OBV⚠️"
+                        atr_val = ta.get("atr_pct")
+                        atr_c   = f"ATR={atr_val:.2f}%" if atr_val is not None else "ATR=N/A"
+                        adx_c   = f"ADX={ta.get('adx','?')}" if ta.get("adx") is not None else ""
+                        stoch_c = f"StochK={ta.get('stoch_k','?')}" if ta.get("stoch_k") is not None else ""
+                        cmf_c   = f"CMF={ta.get('cmf','?')}" if ta.get("cmf") is not None else ""
+                        vwap_c  = f"VWAP={ta.get('vwap','?')}" if ta.get("vwap") is not None else ""
+                        print(f" | RSI={ta.get('rsi','?')} EMA={trend} {macd_c} {bb_c} {obv_c} {atr_c} {adx_c} {stoch_c} {cmf_c} {vwap_c}", end="")
 
                     sig = build_signal(price, change, high, low, vol, ta)
                     print()
@@ -1921,7 +2031,6 @@ def run():
                     sig["sig_id"]    = make_signal_id(sym)
                     last_signal[sym] = sig
 
-                    # ── Phase 1: Execute FIRST - only notify if trade opens ──
                     opened = paper_execute(coin, sig, price)
                     if opened:
                         tg_send(make_signal_msg(coin, sig, price, change))
