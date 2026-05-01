@@ -197,7 +197,9 @@ def _normalize_symbol(raw):
     """Normalize any symbol to XXXUSDT."""
     raw = raw.upper().strip().lstrip("#$")
     raw = raw.replace("/USDT", "").replace("USDT", "").strip().rstrip("/")
-    return raw + "USDT" if raw else None
+    if not raw or raw in _SYM_SKIP:
+        return None
+    return raw + "USDT"
 
 
 # Words that look like symbols but aren't
@@ -272,8 +274,8 @@ def parse_signal(text):
     # ── Stop Loss (required) ──
     sl = None
     for pat in [
-        r"(?:STOP[-\s]?LOSS|STOPLOSS|STOP)[:\s]+([0-9]+\.[0-9]+)",
-        r"\bSL[:\s]+([0-9]+\.[0-9]+)",
+        r"(?:STOP[-\s]?LOSS|STOPLOSS|STOP)[:\s]+([0-9]+(?:\.[0-9]+)?)",
+        r"\bSL[:\s]+([0-9]+(?:\.[0-9]+)?)",
     ]:
         m = re.search(pat, t)
         if m:
@@ -286,11 +288,13 @@ def parse_signal(text):
         return None
 
     # ── Take Profits (need at least 1) ──
+    # Pattern: match TARGET/TP followed by number
+    # Must be a real price — filter out bare integers 1,2,3,4 (TP numbering)
     tps = []
     seen_vals = set()
     for pat in [
-        r"(?:TARGET|TAKE.?PROFIT|TP)\s*\d\s*[:\s]+([0-9]+\.[0-9]+)",
-        r"(?:TARGET|TP)[:\s]+([0-9]+\.[0-9]+)",
+        r"(?:TARGET|TAKE.?PROFIT|TP)\s*\d\s*[:\s]+([0-9]+(?:\.[0-9]+)?)",
+        r"(?:TARGET|TP)[:\s]+([0-9]+(?:\.[0-9]+)?)",
     ]:
         for m in re.finditer(pat, t):
             # Skip TREND-LINE false positives
@@ -299,6 +303,10 @@ def parse_signal(text):
                 continue
             try:
                 val = float(m.group(1))
+                # Skip bare TP numbering (1, 2, 3, 4) — not a real price
+                # Real prices are either decimal OR integer > 10
+                if val <= 10 and '.' not in m.group(1):
+                    continue
                 if val > 0 and val not in seen_vals:
                     seen_vals.add(val)
                     tps.append(val)
