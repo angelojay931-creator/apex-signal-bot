@@ -43,7 +43,7 @@ LEVERAGE           = 5         # 5x → $500 exposure per trade ($100 × 5)
 MIN_CONF           = 82        # Lowered from 85 - more signals, still quality
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
-MAX_OPEN_TRADES    = 3         # Phase 1: max 3 open - 40% free cash minimum
+MAX_OPEN_TRADES    = 6         # Phase 1 speed-up: 6 trades — $600 max deployed
 
 SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
@@ -66,12 +66,12 @@ BLOCKED_COINS = {
 
 # ─────────────── PROFESSIONAL RISK MANAGEMENT ─────────────────
 # Circuit breakers - protect capital when things go wrong
-MAX_DAILY_LOSS_PCT  = 0.05   # Phase 1: tighter - pause if down >5% in a day
+MAX_DAILY_LOSS_PCT  = 0.06   # 6% daily loss limit — tighter than 8%, allows 6 trades
 MAX_CONSEC_LOSSES   = 3      # Pause after 3 consecutive SL hits
 MAX_TRADE_HOURS     = 48     # Force-close positions open > 48 hours
 BTC_CRASH_PCT       = -5.0   # Pause new signals if BTC drops >5% in 1h
-MAX_SAME_DIRECTION  = 2      # Phase 1: max 2 SHORTs + 2 LONGs at any time
-MIN_FREE_CASH_PCT   = 0.40   # Phase 1: always keep 40% free cash
+MAX_SAME_DIRECTION  = 3      # Phase 1 speed-up: max 3 SHORTs + 3 LONGs at any time
+MIN_FREE_CASH_PCT   = 0.30   # 30% free cash floor — allows 6 × $100 on $2,000
 
 # ─────────────────────────── STATE ────────────────────────────
 # RLock: reentrant - make_tp_msg/make_sl_msg re-acquire inside monitor_positions
