@@ -1,41 +1,27 @@
 """
 APEX Copy Signal Lab — Phase 2.5
 ==================================
+Monitors GGShot and Coin_Signals Telegram channels.
+Copies valid signals as paper trades immediately at live market price.
 Completely separate from APEX own signal engine.
-Paper trading only. No real orders ever placed.
 
-Monitors 3 free Telegram signal channels and paper trades their calls.
-After 30-60 days, compare real data to decide which source (if any)
-deserves real money.
+KEY RULES:
+- Paper trading only. No real orders ever.
+- $100 margin x 10x leverage = $1000 exposure per trade
+- Entry = live market price at signal time (ignore entry zone)
+- Uses signal TP1-TP4 and Stop Loss exactly
+- 25% close at each TP, SL moves to breakeven after TP1
+- Separate balances, positions, stats from APEX
+- APEX blocked coins DO NOT apply here
+- APEX RSI/EMA/MACD filters DO NOT apply here
 
-APEX bot is NEVER modified. This runs alongside it.
-
-Railway service: copy-lab
-Start command:   python apex_copy_engine.py
-
-Railway env vars needed:
-  TELEGRAM_TOKEN        (same bot token as APEX)
-  TELEGRAM_CHAT_ID      (same chat as APEX)
-  TELEGRAM_API_ID       (from my.telegram.org)
-  TELEGRAM_API_HASH     (from my.telegram.org)
-  TELETHON_SESSION      (generated once — see setup below)
-
-To generate TELETHON_SESSION string:
-  pip install telethon
-  python3 -c "
-  from telethon.sync import TelegramClient
-  from telethon.sessions import StringSession
-  api_id = YOUR_API_ID
-  api_hash = 'YOUR_API_HASH'
-  with TelegramClient(StringSession(), api_id, api_hash) as client:
-      print(client.session.save())
-  "
-  Paste the output string as TELETHON_SESSION env var on Railway.
-
-Separate balances:
-  GGShot:       $500 paper
-  Coin_Signals: $500 paper
-  Raven:        $500 paper
+Railway env vars:
+  TELEGRAM_TOKEN
+  TELEGRAM_CHAT_ID
+  TELEGRAM_API_ID
+  TELEGRAM_API_HASH
+  TELETHON_SESSION
+  COPY_DATA_DIR   (default: /app)
 """
 
 import os
@@ -51,75 +37,68 @@ from pathlib import Path
 import requests
 from flask import Flask, jsonify
 
-# ─────────────────────────── COPY ENGINE CONFIG ───────────────
-COPY_TRADE_SIZE      = 25.0      # $25 margin per copied trade
-COPY_LEVERAGE        = 10        # 10x → $250 exposure per trade
-COPY_MAX_OPEN        = 2         # max 2 open copy trades per channel
-COPY_SIGNAL_TTL      = 7200      # 2 hours to wait for price to enter zone
-COPY_SLIPPAGE_PCT    = 0.001
+# ─────────────────────────── CONFIG ───────────────────────────
+COPY_TRADE_SIZE   = 100.0    # $100 margin per copied trade
+COPY_LEVERAGE     = 10       # 10x → $1000 exposure
+COPY_MAX_OPEN     = 3        # max open per channel
+COPY_SLIPPAGE_PCT = 0.001    # 0.1% slippage simulation
 
-# Per-channel starting balance
+# Per-channel starting balances
 CHANNEL_BALANCES = {
-    "ggshot":                    500.0,
-    "coin_signals":              500.0,
-    "raven":                     500.0,
+    "ggshot":       500.0,
+    "coin_signals": 500.0,
 }
 
-# Telegram channel usernames to monitor (exact as they appear on Telegram)
+# Telegram channel usernames — exact as they appear on Telegram
 COPY_CHANNELS = {
     "ggshot":       "ggshot",
     "coin_signals": "Coin_Signals",
-    "raven":        "RavenSignalsproofficiaII",
 }
 
 # ─────────────────────────── ENV VARS ─────────────────────────
-TG_TOKEN      = os.environ.get("TELEGRAM_TOKEN",   "").strip()
-TG_CHAT       = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-TG_API_ID     = os.environ.get("TELEGRAM_API_ID",  "").strip()
-TG_API_HASH   = os.environ.get("TELEGRAM_API_HASH","").strip()
-TG_SESSION    = os.environ.get("TELETHON_SESSION", "").strip()
+TG_TOKEN   = os.environ.get("TELEGRAM_TOKEN",    "").strip()
+TG_CHAT    = os.environ.get("TELEGRAM_CHAT_ID",  "").strip()
+TG_API_ID  = os.environ.get("TELEGRAM_API_ID",   "").strip()
+TG_API_HASH= os.environ.get("TELEGRAM_API_HASH", "").strip()
+TG_SESSION = os.environ.get("TELETHON_SESSION",  "").strip()
 
 # ─────────────────────────── DATA PATHS ───────────────────────
-DATA_DIR        = Path(os.environ.get("COPY_DATA_DIR", "/app"))
-COPY_JSON       = DATA_DIR / "copy_trades.json"
-COPY_CSV        = DATA_DIR / "copy_trades.csv"
+DATA_DIR  = Path(os.environ.get("COPY_DATA_DIR", "/app"))
+COPY_JSON = DATA_DIR / "copy_trades.json"
+COPY_CSV  = DATA_DIR / "copy_trades.csv"
 
 CSV_COLUMNS = [
-    "source_channel","message_id","symbol","direction",
-    "entry_price","close_price","close_reason","tp_hit_count",
-    "pnl_usdt","pnl_pct","opened_at","closed_at","duration_minutes",
+    "source_channel", "symbol", "direction",
+    "exec_price", "close_price", "close_reason",
+    "tp_hit_count", "pnl_usdt", "opened_at", "closed_at", "duration_minutes",
 ]
 
 # ─────────────────────────── STATE ────────────────────────────
-state_lock     = threading.RLock()
+state_lock = threading.RLock()
 
-# Per-channel positions: copy_positions["ggshot"]["BTCUSDT"] = {...}
+# Per-channel open positions
 copy_positions = {ch: {} for ch in CHANNEL_BALANCES}
 
 # Per-channel balances (mutable)
-copy_balances  = dict(CHANNEL_BALANCES)
-
-# Pending signals waiting for price to enter zone
-# pending_signals[channel][symbol] = {signal_data, expires_at}
-pending_signals = {ch: {} for ch in CHANNEL_BALANCES}
+copy_balances = dict(CHANNEL_BALANCES)
 
 # Per-channel closed trade history
-copy_closed    = {ch: [] for ch in CHANNEL_BALANCES}
+copy_closed = {ch: [] for ch in CHANNEL_BALANCES}
 
 # Per-channel stats
-copy_stats     = {
-    ch: {
-        "total": 0, "wins": 0, "tp_hit": 0, "sl_hit": 0,
-        "profit": 0.0, "loss": 0.0,
-    }
+copy_stats = {
+    ch: {"total": 0, "wins": 0, "tp_hit": 0, "sl_hit": 0,
+         "profit": 0.0, "loss": 0.0}
     for ch in CHANNEL_BALANCES
 }
 
-copy_paused    = False
-signal_log     = []   # last 20 signal events for /copydebug
-MAX_LOG        = 20
+# Debug log — last 20 signal events
+signal_log  = []
+MAX_LOG     = 20
+copy_paused = False
 
-session_http   = requests.Session()
+session_http = requests.Session()
+
 
 # ─────────────────────────── HELPERS ──────────────────────────
 def utc_now_str():
@@ -129,20 +108,32 @@ def utc_now_str():
 def fmt_p(price):
     if price is None:
         return "N/A"
-    if price >= 1000:    return f"${price:.1f}"
-    if price >= 100:     return f"${price:.2f}"
-    if price >= 1:       return f"${price:.4f}"
-    if price >= 0.01:    return f"${price:.5f}"
+    if price >= 1000:   return f"${price:.2f}"
+    if price >= 100:    return f"${price:.3f}"
+    if price >= 1:      return f"${price:.4f}"
+    if price >= 0.01:   return f"${price:.5f}"
     return f"${price:.8f}"
 
 
 def channel_label(ch):
-    labels = {
-        "ggshot":       "GGShot",
-        "coin_signals": "Coin_Signals",
-        "raven":        "Raven",
+    return {"ggshot": "GGShot", "coin_signals": "Coin_Signals"}.get(ch, ch)
+
+
+def log_event(status, symbol, channel, reason=""):
+    """Record signal event for /copydebug."""
+    global signal_log
+    entry = {
+        "time":    utc_now_str(),
+        "status":  status,
+        "symbol":  symbol or "?",
+        "channel": channel_label(channel) if channel else "?",
+        "reason":  reason,
     }
-    return labels.get(ch, ch.upper())
+    signal_log.append(entry)
+    if len(signal_log) > MAX_LOG:
+        signal_log = signal_log[-MAX_LOG:]
+    icon = {"EXECUTED": "✅", "REJECTED": "❌", "PARSED_OK": "🔍"}.get(status, "•")
+    print(f"  [{status}] {channel}/{symbol} — {reason}")
 
 
 # ─────────────────────────── TELEGRAM ─────────────────────────
@@ -180,10 +171,10 @@ def tg_updates(offset=None):
 _price_cache   = {}
 _price_cache_t = 0.0
 
+
 def get_price(symbol_usdt):
-    """Get live price from Binance for a symbol like BTCUSDT."""
+    """Get live price from Binance."""
     global _price_cache, _price_cache_t
-    # Refresh cache every 10 seconds
     if time.time() - _price_cache_t > 10:
         _price_cache   = {}
         _price_cache_t = time.time()
@@ -201,154 +192,89 @@ def get_price(symbol_usdt):
         return None
 
 
-# ─────────────────────── DEBUG LOGGER ────────────────────────
-def log_signal_event(status, symbol, channel, reason="", extra=""):
-    """
-    Record signal event for /copydebug command.
-    Status: PARSED_OK | EXECUTED | QUEUED | EXECUTED_FROM_PENDING
-            EXPIRED_PENDING | REJECTED
-    """
-    global signal_log
-    entry = {
-        "time":    utc_now_str(),
-        "status":  status,
-        "symbol":  symbol,
-        "channel": channel_label(channel) if channel else "",
-        "reason":  reason,
-        "extra":   extra,
-    }
-    signal_log.append(entry)
-    if len(signal_log) > MAX_LOG:
-        signal_log = signal_log[-MAX_LOG:]
-    # Always print to Railway logs
-    print(f"  [{status}] {channel}/{symbol} — {reason} {extra}".strip())
-
-
-# ─────────────────────── SIGNAL PARSER ────────────────────────
+# ─────────────────────────── PARSER ───────────────────────────
 def _normalize_symbol(raw):
-    """
-    Normalize any symbol format to XXXUSDT.
-    Handles: SOLUSDT, SOL/USDT, #SOL/USDT, $SOL, SOL USDT
-    """
-    raw = raw.upper().strip()
-    # Remove # $ prefixes
-    raw = raw.lstrip('#$')
-    # Remove /USDT or USDT suffix then re-add
-    raw = raw.replace('/USDT', '').replace('USDT', '').strip()
-    # Remove trailing slash
-    raw = raw.rstrip('/')
-    if not raw:
-        return None
-    return raw + 'USDT'
+    """Normalize any symbol to XXXUSDT."""
+    raw = raw.upper().strip().lstrip("#$")
+    raw = raw.replace("/USDT", "").replace("USDT", "").strip().rstrip("/")
+    return raw + "USDT" if raw else None
+
+
+# Words that look like symbols but aren't
+_SYM_SKIP = {
+    "TP", "SL", "BUY", "SELL", "LONG", "SHORT", "ENTRY", "USDT", "USD",
+    "THE", "FOR", "AND", "STOP", "TAKE", "TARGET", "PROFIT", "LOSS",
+    "BINANCE", "BYBIT", "MID", "TERM", "CROSS", "LEVERAGE", "ID",
+    "LAST", "SIGNALS", "STRATEGY", "ACCURACY", "SIGNAL", "DETAILS",
+    "TREND", "LINE", "AFTER", "FIRST", "REST", "ZONE", "TERM",
+}
+
+# Phrases that definitely aren't trading signals
+_NOISE = [
+    "TAKE-PROFIT TARGET", "TP HIT", "PROFIT:", "BOOM", "CONGRAT",
+    "JUST IN:", "BREAKING", "FED ", "ALL-TIME HIGH", "BACK TO BACK",
+    "VIP CHANNEL", "SUBSCRIBE", "JOIN US", "CONTACT:", "FLYING",
+]
 
 
 def parse_signal(text):
     """
-    Robust multi-format signal parser.
-    Returns parsed dict or None if not a valid signal.
-    Logs rejection reason for every failed parse.
+    Parse GGShot and Coin_Signals formats.
+    Returns dict or None.
 
-    A valid signal MUST have ALL of:
-      - Symbol
-      - Direction (LONG/SHORT)
-      - Entry zone or single entry price
-      - Stop Loss
-      - At least 1 Take Profit
+    Valid signal needs: symbol + direction + SL + at least TP1
+    Entry zone is parsed but NOT used for execution.
+    Bot always enters at live market price.
     """
-    if not text or len(text) < 20:
+    if not text or len(text) < 15:
         return None
 
     t = text.upper()
 
-    # ── Quick pre-filter: skip obvious non-signals ──
-    noise_phrases = [
-        'TAKE-PROFIT TARGET', 'TP HIT', 'PROFIT:', 'BOOM', 'CONGRAT',
-        'JUST IN:', 'BREAKING', 'FED ', 'RATE ', 'ALL-TIME HIGH',
-        'BACK TO BACK', 'FLYING', 'SIGNALS THAT SPEAK', 'VIP CHANNEL',
-        'SUBSCRIBE', 'JOIN US', 'CONTACT:', 'TELEGRAM.ME',
-    ]
-    for phrase in noise_phrases:
+    # ── Noise filter ──
+    for phrase in _NOISE:
         if phrase in t:
             return None
 
+    # ── Normalise special chars ──
+    t = (t.replace("\u00d7", "X").replace("\u2715", "X")
+          .replace("\u2019", "'").replace("\u2018", "'")
+          .replace("\u2013", "-").replace("\u2014", "-"))
+
     # ── Direction ──
     direction = None
-    if re.search(r'\bLONG\b|\bBUY\b', t):
-        direction = 'BUY'
-    elif re.search(r'\bSHORT\b|\bSELL\b', t):
-        direction = 'SELL'
+    if re.search(r"#?LONG\b|#?BUY\b|\bGO\s+LONG", t):
+        direction = "BUY"
+    elif re.search(r"#?SHORT\b|#?SELL\b|\bGO\s+SHORT", t):
+        direction = "SELL"
     if not direction:
         return None
 
-    # ── Symbol — try multiple patterns ──
+    # ── Symbol ──
     symbol = None
     sym_patterns = [
-        r'[#$]([A-Z]{2,10})[/\s]?USDT',   # #SOL/USDT or $SOL USDT
-        r'\b([A-Z]{2,10})USDT\b',           # SOLUSDT
-        r'\b([A-Z]{2,10})/USDT\b',          # SOL/USDT
-        r'[#$]([A-Z]{2,10})\b',             # #SOL or $SOL
-        r'\bPAIR[:\s]+([A-Z]{2,10})',       # PAIR: SOL
+        r"[#$]([A-Z]{2,12})[/\s]?USDT",  # #SOLUSDT #SOL/USDT
+        r"\b([A-Z]{2,12})USDT\b",          # SOLUSDT
+        r"\b([A-Z]{2,12})/USDT\b",         # SOL/USDT
+        r"[#$]([A-Z]{2,12})\b",            # #SOL $SOL
     ]
-    skip = {'TP', 'SL', 'BUY', 'SELL', 'LONG', 'SHORT', 'ENTRY',
-            'USDT', 'USD', 'THE', 'FOR', 'AND', 'STOP', 'TAKE',
-            'TARGET', 'PROFIT', 'LOSS', 'BINANCE', 'BYBIT'}
     for pat in sym_patterns:
-        m = re.search(pat, t)
-        if m:
+        for m in re.finditer(pat, t):
             raw = m.group(1).strip()
-            if raw not in skip and len(raw) >= 2:
+            if raw not in _SYM_SKIP and len(raw) >= 2 and not raw.isdigit():
                 symbol = _normalize_symbol(raw)
                 break
+        if symbol:
+            break
     if not symbol:
-        return None  # REJECTED: no symbol
-
-    # ── Entry zone ──
-    entry_low = entry_high = None
-    zone_patterns = [
-        # "Entry: 85.31 - 87.86" or "Entry Zone: 85.31-87.86"
-        r'ENTRY\s*(?:ZONE)?[:\s]*([0-9.]+)\s*[-–TO]+\s*([0-9.]+)',
-        # "Buy Zone 2.10 - 2.08"
-        r'(?:BUY|ENTRY)\s*ZONE[:\s]*([0-9.]+)\s*[-–TO]+\s*([0-9.]+)',
-        # "85.31 to 87.86"
-        r'([0-9.]+)\s+TO\s+([0-9.]+)',
-        # Generic range "85.31 - 87.86" (must be near entry keyword)
-        r'(?:ENTRY|ZONE|PRICE)[^\n]*?([0-9.]+)\s*[-–]\s*([0-9.]+)',
-    ]
-    for pat in zone_patterns:
-        m = re.search(pat, t)
-        if m:
-            try:
-                a, b = float(m.group(1)), float(m.group(2))
-                if a > 0 and b > 0:
-                    entry_low  = min(a, b)
-                    entry_high = max(a, b)
-                    break
-            except Exception:
-                pass
-
-    # Single entry price fallback
-    if not entry_low:
-        m = re.search(r'ENTRY[:\s]+([0-9.]+)', t)
-        if m:
-            try:
-                v = float(m.group(1))
-                if v > 0:
-                    # Create a small zone ±0.5% around single price
-                    entry_low  = round(v * 0.995, 8)
-                    entry_high = round(v * 1.005, 8)
-            except Exception:
-                pass
-
-    if not entry_low:
-        return None  # REJECTED: no entry
+        return None
 
     # ── Stop Loss (required) ──
     sl = None
-    sl_patterns = [
-        r'(?:STOPLOSS|STOP\s*LOSS|STOP)[:\s]+([0-9.]+)',
-        r'\bSL[:\s]+([0-9.]+)',
-    ]
-    for pat in sl_patterns:
+    for pat in [
+        r"(?:STOP[-\s]?LOSS|STOPLOSS|STOP)[:\s]+([0-9]+\.[0-9]+)",
+        r"\bSL[:\s]+([0-9]+\.[0-9]+)",
+    ]:
         m = re.search(pat, t)
         if m:
             try:
@@ -357,76 +283,67 @@ def parse_signal(text):
             except Exception:
                 pass
     if not sl:
-        return None  # REJECTED: no SL
+        return None
 
-    # ── Take Profits (at least 1 required) ──
+    # ── Take Profits (need at least 1) ──
     tps = []
-    tp_patterns = [
-        r'(?:TARGET|TAKE.?PROFIT|TP)\s*(\d)\s*[:\s]+([0-9.]+)',
-        r'(?:TARGET|TP)[:\s]+([0-9.]+)',
-        r'T\s*(\d)\s*[:\s]+([0-9.]+)',
-    ]
-    seen = set()
-    for pat in tp_patterns:
+    seen_vals = set()
+    for pat in [
+        r"(?:TARGET|TAKE.?PROFIT|TP)\s*\d\s*[:\s]+([0-9]+\.[0-9]+)",
+        r"(?:TARGET|TP)[:\s]+([0-9]+\.[0-9]+)",
+    ]:
         for m in re.finditer(pat, t):
+            # Skip TREND-LINE false positives
+            before = t[max(0, m.start() - 12):m.start()]
+            if "TREND" in before:
+                continue
             try:
-                val = float(m.group(2) if m.lastindex >= 2 else m.group(1))
-                if val > 0 and val not in seen:
-                    seen.add(val)
+                val = float(m.group(1))
+                if val > 0 and val not in seen_vals:
+                    seen_vals.add(val)
                     tps.append(val)
             except Exception:
                 pass
-
     if not tps:
-        return None  # REJECTED: no TPs
+        return None
 
-    # Sort TPs in correct direction
-    if direction == 'BUY':
-        tps = sorted(tps)       # ascending for longs
-    else:
-        tps = sorted(tps, reverse=True)  # descending for shorts
+    # ── Sort TPs correctly ──
+    tps = sorted(tps) if direction == "BUY" else sorted(tps, reverse=True)
 
-    # Pad to 4 TPs
+    # ── Pad to 4 TPs ──
     while len(tps) < 4:
         if len(tps) >= 2:
             diff = abs(tps[-1] - tps[-2])
-            if direction == 'BUY':
-                tps.append(round(tps[-1] + diff, 8))
-            else:
-                tps.append(round(tps[-1] - diff, 8))
         else:
-            gap = abs(tps[0] - (entry_low + entry_high) / 2) * 0.5
-            if direction == 'BUY':
-                tps.append(round(tps[-1] + gap, 8))
-            else:
-                tps.append(round(tps[-1] - gap, 8))
+            diff = abs(tps[0] * 0.01)
+        nxt = tps[-1] + diff if direction == "BUY" else tps[-1] - diff
+        tps.append(round(nxt, 8))
 
-    # ── Validate direction logic ──
-    entry_mid = (entry_low + entry_high) / 2
-    if direction == 'BUY':
-        if sl >= entry_mid:     return None  # SL above entry — invalid
-        if tps[0] <= entry_mid: return None  # TP below entry — invalid
+    # ── Validate SL vs TP direction logic ──
+    # Use TP1 as reference since we enter at market price
+    tp1 = tps[0]
+    if direction == "BUY":
+        if sl >= tp1:   return None  # SL above TP = invalid
     else:
-        if sl <= entry_mid:     return None  # SL below entry — invalid
-        if tps[0] >= entry_mid: return None  # TP above entry — invalid
+        if sl <= tp1:   return None  # SL below TP = invalid
 
     return {
-        "symbol":      symbol,
-        "direction":   direction,
-        "entry_low":   entry_low,
-        "entry_high":  entry_high,
-        "entry_mid":   entry_mid,
-        "tp1":         tps[0],
-        "tp2":         tps[1],
-        "tp3":         tps[2],
-        "tp4":         tps[3],
-        "sl":          sl,
+        "symbol":    symbol,
+        "direction": direction,
+        "tp1":       tps[0],
+        "tp2":       tps[1],
+        "tp3":       tps[2],
+        "tp4":       tps[3],
+        "sl":        sl,
     }
 
 
-# ─────────────────── COPY EXECUTE ─────────────────────────────
+# ─────────────────────────── EXECUTE ──────────────────────────
 def copy_execute(channel, sig, price, msg_id):
-    """Open a paper copy trade for the given channel."""
+    """
+    Open a paper copy trade at current live market price.
+    Ignores entry zone — enters immediately.
+    """
     sym       = sig["symbol"]
     direction = sig["direction"]
     notional  = COPY_TRADE_SIZE * COPY_LEVERAGE
@@ -439,18 +356,17 @@ def copy_execute(channel, sig, price, msg_id):
         liq_price  = round(exec_price * (1 + 0.9 / COPY_LEVERAGE), 8)
 
     with state_lock:
-        if copy_balances[channel] < COPY_TRADE_SIZE:
-            print(f"  ⛔ Copy balance too low for {channel}")
-            return False
         if sym in copy_positions[channel]:
-            print(f"  ⛔ {sym} already open in {channel}")
+            log_event("REJECTED", sym, channel, "already open")
             return False
-        n_open = len(copy_positions[channel])
-        if n_open >= COPY_MAX_OPEN:
-            print(f"  ⛔ Max copy trades reached for {channel}")
+        if copy_balances[channel] < COPY_TRADE_SIZE:
+            log_event("REJECTED", sym, channel, "balance too low")
+            return False
+        if len(copy_positions[channel]) >= COPY_MAX_OPEN:
+            log_event("REJECTED", sym, channel, f"max {COPY_MAX_OPEN} open")
             return False
 
-        copy_balances[channel]    -= COPY_TRADE_SIZE
+        copy_balances[channel] -= COPY_TRADE_SIZE
         copy_positions[channel][sym] = {
             "source_channel": channel,
             "message_id":     msg_id,
@@ -472,33 +388,38 @@ def copy_execute(channel, sig, price, msg_id):
             "unrealized_pnl": 0.0,
             "opened_at":      time.time(),
         }
+        bal_now = copy_balances[channel]
 
     label = channel_label(channel)
     side  = "LONG" if direction == "BUY" else "SHORT"
     tg_send(
         f"<b>📥 COPY TRADE OPENED</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Source: <b>{label}</b>\n"
-        f"Coin: <b>{sym}</b>  {side}\n"
-        f"Entry: {fmt_p(exec_price)}\n"
-        f"${COPY_TRADE_SIZE:.0f} margin | {COPY_LEVERAGE}x\n\n"
-        f"TP1: {fmt_p(sig['tp1'])}  TP2: {fmt_p(sig['tp2'])}\n"
-        f"TP3: {fmt_p(sig['tp3'])}  TP4: {fmt_p(sig['tp4'])}\n"
-        f"SL:  {fmt_p(sig['sl'])}\n\n"
-        f"Balance [{label}]: ${copy_balances[channel]:.2f}"
+        f"Source: <b>{label}</b>  |  <b>{sym} {side}</b>\n"
+        f"Entry:  {fmt_p(exec_price)}\n"
+        f"Margin: ${COPY_TRADE_SIZE:.0f}  |  {COPY_LEVERAGE}x  |  "
+        f"Exposure: ${notional:.0f}\n\n"
+        f"TP1: {fmt_p(sig['tp1'])}\n"
+        f"TP2: {fmt_p(sig['tp2'])}\n"
+        f"TP3: {fmt_p(sig['tp3'])}\n"
+        f"TP4: {fmt_p(sig['tp4'])}\n"
+        f"SL:  {fmt_p(sig['sl'])}\n"
+        f"Liq: {fmt_p(liq_price)}\n\n"
+        f"Balance [{label}]: ${bal_now:.2f}"
     )
-    print(f"  📥 Copy trade: {channel}/{sym} {direction} @ {exec_price}")
+    log_event("EXECUTED", sym, channel, f"@ {exec_price}")
+    print(f"  📥 Copy opened: {channel}/{sym} {direction} @ {exec_price}")
     return True
 
 
-# ─────────────────── COPY MONITOR ─────────────────────────────
+# ─────────────────────────── MONITOR ──────────────────────────
 def monitor_copy_positions():
-    """Check all open copy positions for TP/SL hits."""
-    for channel, positions in copy_positions.items():
-        to_remove  = []
+    """Check all open copy positions for TP/SL hits every cycle."""
+    for channel in list(copy_positions.keys()):
+        to_remove     = []
         notifications = []
 
-        for sym, pos in list(positions.items()):
+        for sym, pos in list(copy_positions[channel].items()):
             price = get_price(sym)
             if not price:
                 continue
@@ -512,9 +433,9 @@ def monitor_copy_positions():
                 tp_levels  = [pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"]]
                 margin     = pos["margin"]
                 elapsed    = time.time() - pos["opened_at"]
+                rem_pct    = 1.0 - (tp_hit * 0.25)
 
-                # Live unrealized PnL
-                rem_pct = 1.0 - (tp_hit * 0.25)
+                # ── Live unrealized P&L ──
                 if direction == "BUY":
                     move_pct = (price - exec_price) / exec_price * 100
                 else:
@@ -522,43 +443,44 @@ def monitor_copy_positions():
                 pos["unrealized_pnl"] = round(
                     margin * COPY_LEVERAGE * move_pct / 100 * rem_pct, 2)
 
-                # ── Liquidation ──
-                liq_hit = (direction == "BUY"  and price <= liq_price) or \
-                          (direction == "SELL" and price >= liq_price)
+                # ── SL / Liquidation check (SL first) ──
                 sl_hit  = (direction == "BUY"  and price <= sl) or \
                           (direction == "SELL" and price >= sl)
+                liq_hit = (direction == "BUY"  and price <= liq_price) or \
+                          (direction == "SELL" and price >= liq_price)
 
-                # SL check first (same as APEX Phase 1 principle)
                 if sl_hit or liq_hit:
-                    close_price  = sl  # close at SL even if liq triggered
-                    rem_pct_n    = 1.0 - (tp_hit * 0.25)
-                    price_move   = abs(close_price - exec_price) / exec_price * 100
-                    is_profit    = (direction == "BUY"  and close_price >= exec_price) or \
-                                   (direction == "SELL" and close_price <= exec_price)
-                    sl_pnl       = round(margin * COPY_LEVERAGE * price_move / 100 * rem_pct_n, 2)
-                    prior        = pos.get("currentPnl", 0)
-                    total_pnl    = round(prior + (sl_pnl if is_profit else -sl_pnl), 2)
-                    remaining    = margin * rem_pct_n
+                    close_price = sl
+                    price_move  = abs(close_price - exec_price) / exec_price * 100
+                    is_profit   = (direction == "BUY"  and close_price >= exec_price) or \
+                                  (direction == "SELL" and close_price <= exec_price)
+                    sl_pnl      = round(margin * COPY_LEVERAGE * price_move / 100 * rem_pct, 2)
+                    prior       = pos.get("currentPnl", 0)
+                    total_pnl   = round(prior + (sl_pnl if is_profit else -sl_pnl), 2)
+                    remaining   = margin * rem_pct
 
                     if is_profit:
-                        copy_balances[channel]       += remaining + sl_pnl
+                        copy_balances[channel]        += remaining + sl_pnl
                         copy_stats[channel]["profit"] += sl_pnl
                     else:
                         copy_balances[channel]       += max(0, remaining - sl_pnl)
-                        copy_stats[channel]["loss"]   += sl_pnl
+                        copy_stats[channel]["loss"]  += sl_pnl
 
-                    copy_stats[channel]["total"]   += 1
-                    copy_stats[channel]["sl_hit"]  += 1
+                    copy_stats[channel]["total"]  += 1
+                    copy_stats[channel]["sl_hit"] += 1
                     if is_profit or pos.get("breakeven"):
                         copy_stats[channel]["wins"] += 1
+
                     close_reason = "SL" if sl_hit else "GAP_SL"
                     _save_copy_trade(channel, sym, pos, close_price,
                                      close_reason, total_pnl)
                     label = channel_label(channel)
                     sign  = "+" if total_pnl >= 0 else ""
+                    mins  = int(elapsed // 60)
                     notifications.append(
                         f"<b>📊 COPY CLOSED — {sym}</b>\n"
-                        f"Source: {label} | {close_reason}\n"
+                        f"Source: {label}  |  {close_reason}\n"
+                        f"Time: {mins}m\n"
                         f"Result: {sign}${total_pnl:.2f} USDT\n"
                         f"Balance [{label}]: ${copy_balances[channel]:.2f}"
                     )
@@ -570,21 +492,20 @@ def monitor_copy_positions():
                     to_remove.append(sym)
                     continue
 
-                next_tp     = tp_levels[tp_hit]
-                tp_reached  = (direction == "BUY"  and price >= next_tp) or \
-                              (direction == "SELL" and price <= next_tp)
+                next_tp    = tp_levels[tp_hit]
+                tp_reached = (direction == "BUY"  and price >= next_tp) or \
+                             (direction == "SELL" and price <= next_tp)
 
                 if tp_reached:
-                    tp_num     = tp_hit + 1
-                    pnl_pct    = abs(next_tp - exec_price) / exec_price * 100
-                    tp_pnl     = round(margin * COPY_LEVERAGE * pnl_pct / 100 * 0.25, 2)
-                    q_margin   = margin * 0.25
+                    tp_num   = tp_hit + 1
+                    pnl_pct  = abs(next_tp - exec_price) / exec_price * 100
+                    tp_pnl   = round(margin * COPY_LEVERAGE * pnl_pct / 100 * 0.25, 2)
 
-                    copy_balances[channel]           += q_margin + tp_pnl
-                    copy_stats[channel]["profit"]    += tp_pnl
-                    copy_stats[channel]["tp_hit"]    += 1
-                    pos["currentPnl"]                 = round(pos.get("currentPnl", 0) + tp_pnl, 2)
-                    pos["tp_hit"]                     = tp_num
+                    copy_balances[channel]        += margin * 0.25 + tp_pnl
+                    copy_stats[channel]["profit"] += tp_pnl
+                    copy_stats[channel]["tp_hit"] += 1
+                    pos["currentPnl"]              = round(pos.get("currentPnl", 0) + tp_pnl, 2)
+                    pos["tp_hit"]                  = tp_num
 
                     # Trail SL
                     if tp_num == 1 and not pos["breakeven"]:
@@ -600,7 +521,8 @@ def monitor_copy_positions():
                         f"<b>✅ COPY TP{tp_num} HIT — {sym}</b>\n"
                         f"Source: {label}\n"
                         f"+${tp_pnl:.2f} USDT  |  "
-                        f"Trade so far: +${pos['currentPnl']:.2f}"
+                        f"Trade so far: +${pos['currentPnl']:.2f}\n"
+                        f"{'🔒 SL moved to breakeven' if tp_num == 1 else f'SL trailed to TP{tp_num-1}'}"
                     )
 
                     if tp_num == 4:
@@ -625,43 +547,7 @@ def monitor_copy_positions():
             tg_send(msg)
 
 
-# ─────────────────── PENDING SIGNALS ──────────────────────────
-def check_pending_signals():
-    """Check if any pending signals have entered their entry zone."""
-    now = time.time()
-    for channel, pending in pending_signals.items():
-        expired = []
-        for sym, ps in list(pending.items()):
-            if now > ps["expires_at"]:
-                expired.append(sym)
-                log_signal_event("EXPIRED_PENDING", sym, channel,
-                                 "2h window passed without price entering zone")
-                continue
-            price = get_price(sym)
-            if not price:
-                continue
-            sig     = ps["sig"]
-            in_zone = sig["entry_low"] <= price <= sig["entry_high"]
-            if in_zone:
-                # Check still valid
-                with state_lock:
-                    if sym in copy_positions[channel]:
-                        expired.append(sym)
-                        continue
-                    if len(copy_positions[channel]) >= COPY_MAX_OPEN:
-                        expired.append(sym)
-                        continue
-                opened = copy_execute(channel, sig, price, ps["msg_id"])
-                if opened:
-                    log_signal_event("EXECUTED_FROM_PENDING", sym, channel,
-                                     "price entered zone", f"price={price}")
-                expired.append(sym)
-
-        for sym in expired:
-            pending.pop(sym, None)
-
-
-# ─────────────────── PERSISTENCE ──────────────────────────────
+# ─────────────────────────── PERSISTENCE ──────────────────────
 def _ensure_dirs():
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -670,38 +556,29 @@ def _ensure_dirs():
 
 
 def _save_copy_trade(channel, sym, pos, close_price, close_reason, pnl_usdt):
-    """Append closed copy trade to JSON and CSV."""
+    """Save closed trade to JSON and CSV."""
     _ensure_dirs()
-    opened_ts  = pos.get("opened_at", time.time())
-    closed_ts  = time.time()
-    dur        = round((closed_ts - opened_ts) / 60, 1)
-    pnl_pct    = round(pnl_usdt / pos.get("margin", COPY_TRADE_SIZE) * 100, 2)
-
+    opened_ts = pos.get("opened_at", time.time())
+    closed_ts = time.time()
     rec = {
-        "source_channel":  channel,
-        "message_id":      pos.get("message_id", ""),
-        "symbol":          sym,
-        "direction":       pos.get("direction", ""),
-        "entry_price":     pos.get("entry_price", 0),
-        "close_price":     close_price,
-        "close_reason":    close_reason,
-        "tp_hit_count":    pos.get("tp_hit", 0),
-        "pnl_usdt":        round(pnl_usdt, 2),
-        "pnl_pct":         pnl_pct,
-        "opened_at":       datetime.fromtimestamp(opened_ts, tz=timezone.utc).isoformat(),
-        "closed_at":       datetime.fromtimestamp(closed_ts, tz=timezone.utc).isoformat(),
-        "duration_minutes":dur,
+        "source_channel":   channel,
+        "symbol":           sym,
+        "direction":        pos.get("direction", ""),
+        "exec_price":       pos.get("exec_price", 0),
+        "close_price":      close_price,
+        "close_reason":     close_reason,
+        "tp_hit_count":     pos.get("tp_hit", 0),
+        "pnl_usdt":         round(pnl_usdt, 2),
+        "opened_at":        datetime.fromtimestamp(opened_ts, tz=timezone.utc).isoformat(),
+        "closed_at":        datetime.fromtimestamp(closed_ts, tz=timezone.utc).isoformat(),
+        "duration_minutes": round((closed_ts - opened_ts) / 60, 1),
     }
-
-    # JSON
     try:
         existing = json.loads(COPY_JSON.read_text()) if COPY_JSON.exists() else []
         existing.append(rec)
         COPY_JSON.write_text(json.dumps(existing, indent=2))
     except Exception as e:
-        print(f"  ⚠️ Copy JSON save failed: {e}")
-
-    # CSV
+        print(f"  ⚠️ JSON save failed: {e}")
     try:
         write_header = not COPY_CSV.exists()
         with open(COPY_CSV, "a", newline="") as f:
@@ -710,14 +587,12 @@ def _save_copy_trade(channel, sym, pos, close_price, close_reason, pnl_usdt):
                 w.writeheader()
             w.writerow(rec)
     except Exception as e:
-        print(f"  ⚠️ Copy CSV save failed: {e}")
-
-    # In-memory
+        print(f"  ⚠️ CSV save failed: {e}")
     copy_closed[channel].append(rec)
 
 
 def load_copy_history():
-    """Reload closed copy trades on restart."""
+    """Reload closed trades and restore balances on restart."""
     _ensure_dirs()
     if not COPY_JSON.exists():
         print("  📂 No copy_trades.json — starting fresh")
@@ -732,129 +607,74 @@ def load_copy_history():
                 continue
             copy_closed[ch].append(rec)
             copy_stats[ch]["total"] += 1
+            copy_stats[ch]["tp_hit"] += rec.get("tp_hit_count", 0)
             if pnl > 0:
                 copy_stats[ch]["profit"] += pnl
                 copy_stats[ch]["wins"]   += 1
             else:
                 copy_stats[ch]["loss"]   += abs(pnl)
-            copy_stats[ch]["tp_hit"] += rec.get("tp_hit_count", 0)
             if cr in ("SL", "GAP_SL"):
                 copy_stats[ch]["sl_hit"] += 1
         # Restore balances from history
         for ch in copy_balances:
             hist_net = sum(r["pnl_usdt"] for r in copy_closed[ch])
             copy_balances[ch] = round(CHANNEL_BALANCES[ch] + hist_net, 2)
-        n = len(saved)
-        print(f"  📂 Loaded {n} copy trades from history")
-        tg_send(f"<b>📂 Copy history loaded</b>\n{n} trades restored.")
+        print(f"  📂 Loaded {len(saved)} copy trades")
+        tg_send(f"<b>📂 Copy history loaded</b>\n{len(saved)} trades restored.")
     except Exception as e:
-        print(f"  ⚠️ Could not load copy history: {e}")
+        print(f"  ⚠️ Load history failed: {e}")
 
 
-# ─────────────────── TELEGRAM COMMANDS ────────────────────────
+# ─────────────────────────── COMMANDS ─────────────────────────
 def _cmd_copyreport():
     with state_lock:
-        total_open = sum(len(p) for p in copy_positions.values())
         lines = []
         for ch in CHANNEL_BALANCES:
-            s   = copy_stats[ch]
-            wr  = round(s["wins"]/s["total"]*100, 1) if s["total"] else 0
-            net = round(s["profit"] - s["loss"], 2)
-            sign= "+" if net >= 0 else ""
-            n_open = len(copy_positions[ch])
+            s    = copy_stats[ch]
+            wr   = round(s["wins"] / s["total"] * 100, 1) if s["total"] else 0
+            net  = round(s["profit"] - s["loss"], 2)
+            sign = "+" if net >= 0 else ""
+            open_n = len(copy_positions[ch])
             lines.append(
                 f"<b>{channel_label(ch)}</b>\n"
-                f"  Balance: ${copy_balances[ch]:.2f}  |  Open: {n_open}\n"
-                f"  Trades: {s['total']}  WR: {wr}%  Net: {sign}${net:.2f}"
+                f"  Balance: ${copy_balances[ch]:.2f}  |  Open: {open_n}\n"
+                f"  Trades: {s['total']}  WR: {wr}%  Net: {sign}${net:.2f}\n"
+                f"  TPs hit: {s['tp_hit']}  SLs: {s['sl_hit']}"
             )
         total_closed = sum(s["total"] for s in copy_stats.values())
-        all_profit   = sum(s["profit"] for s in copy_stats.values())
-        all_loss     = sum(s["loss"]   for s in copy_stats.values())
-        net_all      = round(all_profit - all_loss, 2)
+        total_net    = sum(
+            round(copy_stats[ch]["profit"] - copy_stats[ch]["loss"], 2)
+            for ch in copy_stats
+        )
+        paused_str = "\n⚠️ Copy engine PAUSED" if copy_paused else ""
 
-        # Best/worst channel by net
-        nets = {ch: round(copy_stats[ch]["profit"]-copy_stats[ch]["loss"],2)
-                for ch in copy_stats}
-        best  = max(nets, key=nets.get)
-        worst = min(nets, key=nets.get)
-
-    paused_str = "\n⚠️ Copy engine PAUSED" if copy_paused else ""
     return (
         f"<b>📊 COPY SIGNAL LAB — {utc_now_str()}</b>\n"
         f"══════════════════════════════\n"
-        f"Total closed: {total_closed}  |  Open: {total_open}\n"
-        f"Combined net: {'+'if net_all>=0 else ''}${net_all:.2f}\n"
-        f"Best channel:  {channel_label(best)} (${nets[best]:+.2f})\n"
-        f"Worst channel: {channel_label(worst)} (${nets[worst]:+.2f})\n"
+        f"Total closed: {total_closed}  |  "
+        f"Combined net: {'+'if total_net>=0 else ''}${total_net:.2f}\n"
+        f"Trade size: ${COPY_TRADE_SIZE:.0f} × {COPY_LEVERAGE}x\n"
         f"{paused_str}\n\n"
         + "\n\n".join(lines)
     )
 
 
-def _cmd_copychannels():
-    lines = []
-    for ch, username in COPY_CHANNELS.items():
-        n_open   = len(copy_positions[ch])
-        n_closed = copy_stats[ch]["total"]
-        lines.append(
-            f"<b>{channel_label(ch)}</b> @{username}\n"
-            f"  Open: {n_open} | Closed: {n_closed} | "
-            f"Balance: ${copy_balances[ch]:.2f}"
-        )
-    return (
-        f"<b>📡 TRACKED CHANNELS</b>\n\n"
-        + "\n\n".join(lines)
-    )
-
-
 def _cmd_copydebug():
-    """Show last 10 signal events."""
     if not signal_log:
         return "<b>📋 COPY DEBUG</b>\n\nNo signals received yet."
-    recent = signal_log[-10:]
-    icons  = {
-        "PARSED_OK":             "🔍",
-        "EXECUTED":              "✅",
-        "QUEUED":                "⏳",
-        "EXECUTED_FROM_PENDING": "🚀",
-        "EXPIRED_PENDING":       "⏰",
-        "REJECTED":              "❌",
+    icons = {
+        "EXECUTED": "✅", "REJECTED": "❌",
+        "PARSED_OK": "🔍", "EXPIRED": "⏰",
     }
     lines = []
-    for e in reversed(recent):
+    for e in reversed(signal_log[-10:]):
         icon = icons.get(e["status"], "•")
         lines.append(
             f"{icon} <b>{e['status']}</b> — {e['channel']}/{e['symbol']}\n"
             f"   {e['time']}  {e['reason']}"
         )
     return (
-        f"<b>📋 COPY DEBUG — last {len(recent)} signals</b>\n"
-        f"══════════════════════════════\n\n"
-        + "\n\n".join(lines)
-    )
-
-
-def _cmd_pendingcopy():
-    """Show all pending signals with time remaining."""
-    lines = []
-    now   = time.time()
-    for channel, pending in pending_signals.items():
-        for sym, ps in pending.items():
-            sig         = ps["sig"]
-            remaining   = max(0, ps["expires_at"] - now)
-            mins        = int(remaining // 60)
-            price       = get_price(sym)
-            price_str   = fmt_p(price) if price else "N/A"
-            side        = "LONG" if sig["direction"] == "BUY" else "SHORT"
-            lines.append(
-                f"<b>{sym}</b> {side} [{channel_label(channel)}]\n"
-                f"  Zone: {fmt_p(sig['entry_low'])} – {fmt_p(sig['entry_high'])}\n"
-                f"  Now:  {price_str}  |  Expires: {mins}m"
-            )
-    if not lines:
-        return "<b>⏳ PENDING SIGNALS</b>\n\nNone waiting."
-    return (
-        f"<b>⏳ PENDING SIGNALS ({len(lines)})</b>\n"
+        f"<b>📋 COPY DEBUG — last {len(lines)} events</b>\n"
         f"══════════════════════════════\n\n"
         + "\n\n".join(lines)
     )
@@ -870,28 +690,22 @@ def check_copy_commands(offset):
             text = msg.get("text", "").strip().lower()
             if text == "/copyreport":
                 tg_send(_cmd_copyreport())
-            elif text == "/copychannels":
-                tg_send(_cmd_copychannels())
             elif text == "/copydebug":
                 tg_send(_cmd_copydebug())
-            elif text == "/pendingcopy":
-                tg_send(_cmd_pendingcopy())
             elif text == "/copypause":
                 copy_paused = True
-                tg_send("<b>⏸ Copy engine paused.</b>")
+                tg_send("<b>⏸ Copy engine paused.</b>\nSend /copyresume to restart.")
             elif text == "/copyresume":
                 copy_paused = False
                 tg_send("<b>▶️ Copy engine resumed.</b>")
             elif text == "/copyhelp":
                 tg_send(
                     "<b>📡 Copy Lab Commands</b>\n\n"
-                    "/copyreport    — Full lab report\n"
-                    "/copychannels  — Show tracked channels\n"
-                    "/copydebug     — Last 10 signal events\n"
-                    "/pendingcopy   — Pending signals + time left\n"
-                    "/copypause     — Pause new copies\n"
-                    "/copyresume    — Resume\n"
-                    "/copyhelp      — This message"
+                    "/copyreport  — Full report\n"
+                    "/copydebug   — Last 10 signal events\n"
+                    "/copypause   — Pause new copies\n"
+                    "/copyresume  — Resume\n"
+                    "/copyhelp    — This message"
                 )
     return offset
 
@@ -899,9 +713,11 @@ def check_copy_commands(offset):
 # ─────────────────────────── FLASK ────────────────────────────
 app = Flask(__name__)
 
+
 @app.route("/")
 def health():
     return "APEX Copy Lab running!", 200
+
 
 @app.route("/data")
 def get_data():
@@ -914,16 +730,17 @@ def get_data():
                     "symbol":        sym,
                     "direction":     pos["direction"],
                     "entry":         pos["entry_price"],
+                    "exec":          pos["exec_price"],
                     "tp_hit":        pos["tp_hit"],
                     "breakeven":     pos["breakeven"],
                     "unrealized":    pos.get("unrealized_pnl", 0),
                     "realized":      pos.get("currentPnl", 0),
                 }
         payload = {
-            "balances":    copy_balances,
-            "stats":       copy_stats,
-            "openTrades":  open_pos,
-            "timestamp":   utc_now_str(),
+            "balances":   copy_balances,
+            "stats":      copy_stats,
+            "openTrades": open_pos,
+            "timestamp":  utc_now_str(),
         }
     resp = jsonify(payload)
     resp.headers.add("Access-Control-Allow-Origin", "*")
@@ -937,20 +754,14 @@ def start_flask():
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 
-# ─────────────────── TELETHON LISTENER ────────────────────────
+# ─────────────────────────── TELETHON ─────────────────────────
 def start_telethon():
-    """
-    Start Telethon async listener in a background thread.
-    Monitors signal channels and triggers copy_execute.
-    Requires TELEGRAM_API_ID, TELEGRAM_API_HASH, TELETHON_SESSION.
-    """
+    """Monitor signal channels via Telethon user API."""
     if not TG_API_ID or not TG_API_HASH or not TG_SESSION:
-        print("  ⚠️ Telethon not configured — copy engine in MANUAL mode")
-        print("  Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELETHON_SESSION")
+        print("  ⚠️ Telethon not configured")
         tg_send(
-            "<b>⚠️ Copy Lab — Telethon not configured</b>\n\n"
-            "Set env vars to enable channel monitoring:\n"
-            "TELEGRAM_API_ID\nTELEGRAM_API_HASH\nTELETHON_SESSION"
+            "<b>⚠️ Copy Lab — Telethon not configured</b>\n"
+            "Set: TELEGRAM_API_ID, TELEGRAM_API_HASH, TELETHON_SESSION"
         )
         return
 
@@ -958,111 +769,77 @@ def start_telethon():
         from telethon import TelegramClient, events
         from telethon.sessions import StringSession
     except ImportError:
-        print("  ⚠️ telethon not installed — run: pip install telethon")
-        tg_send("<b>⚠️ Copy Lab</b> — telethon not installed.\nRun: pip install telethon")
+        print("  ⚠️ telethon not installed")
+        tg_send("<b>⚠️ Copy Lab</b> — run: pip install telethon")
         return
 
     async def _run():
         client = TelegramClient(
-            StringSession(TG_SESSION),
-            int(TG_API_ID),
-            TG_API_HASH,
-        )
+            StringSession(TG_SESSION), int(TG_API_ID), TG_API_HASH)
         await client.start()
-        print(f"  ✅ Telethon connected")
+        print("  ✅ Telethon connected")
 
         channel_list = list(COPY_CHANNELS.values())
 
         @client.on(events.NewMessage(chats=channel_list))
         async def handler(event):
-            text = event.message.message or ""
+            text   = event.message.message or ""
             msg_id = event.message.id
             chat   = event.chat
 
-            # Identify which channel key this came from
+            # Identify channel
             channel_key = None
+            chat_user   = (getattr(chat, "username", "") or "").lower()
             for key, username in COPY_CHANNELS.items():
-                if username.lower() in (getattr(chat, 'username', '') or '').lower():
+                if username.lower() in chat_user:
                     channel_key = key
                     break
             if not channel_key:
                 return
 
-            print(f"  📨 New msg from {channel_key}: {text[:60]}")
-            sig = parse_signal(text)
+            print(f"  📨 {channel_key}: {text[:60].replace(chr(10),' ')}")
 
+            if copy_paused:
+                return
+
+            sig = parse_signal(text)
             if not sig:
-                # Log rejection with reason
+                # Log rejection reason
                 t = text.upper()
-                if not any(w in t for w in ['LONG','SHORT','BUY','SELL']):
+                if not re.search(r"#?LONG\b|#?BUY\b|#?SHORT\b|#?SELL\b", t):
                     reason = "no direction"
-                elif not any(w in t for w in ['USDT','BTC','ETH','SOL','BNB']):
-                    reason = "no symbol"
-                elif not any(w in t for w in ['SL','STOP']):
-                    reason = "missing SL"
-                elif not any(w in t for w in ['TP','TARGET','TAKE']):
-                    reason = "no targets"
-                elif not any(w in t for w in ['ENTRY','ZONE','BUY ZONE']):
-                    reason = "no entry zone"
+                elif not any(c.isdigit() for c in t):
+                    reason = "no numbers"
+                elif not re.search(r"STOP|STOPLOSS|SL\b", t):
+                    reason = "no SL"
+                elif not re.search(r"TARGET|TP\d|TAKE.?PROFIT", t):
+                    reason = "no TPs"
                 else:
                     reason = "invalid format"
-                log_signal_event("REJECTED", "?", channel_key, reason,
-                                 text[:40].replace('\n',' '))
+                log_event("REJECTED", None, channel_key, reason)
                 return
 
             sym = sig["symbol"]
-            log_signal_event("PARSED_OK", sym, channel_key,
-                             f"{sig['direction']} entry={sig['entry_low']}-{sig['entry_high']} SL={sig['sl']}")
+            log_event("PARSED_OK", sym, channel_key,
+                      f"{sig['direction']} SL={sig['sl']}")
 
-            if copy_paused:
-                log_signal_event("REJECTED", sym, channel_key, "copy engine paused")
-                return
-
-            # Safety filters
+            # Check not already open
             with state_lock:
                 if sym in copy_positions[channel_key]:
-                    log_signal_event("REJECTED", sym, channel_key, "already open")
+                    log_event("REJECTED", sym, channel_key, "already open")
                     return
                 if len(copy_positions[channel_key]) >= COPY_MAX_OPEN:
-                    log_signal_event("REJECTED", sym, channel_key,
-                                     f"max {COPY_MAX_OPEN} trades open")
+                    log_event("REJECTED", sym, channel_key,
+                              f"max {COPY_MAX_OPEN} open")
                     return
 
+            # Get live price and enter immediately
             price = get_price(sym)
             if not price:
-                log_signal_event("REJECTED", sym, channel_key, "no price available")
+                log_event("REJECTED", sym, channel_key, "no price from Binance")
                 return
 
-            # Check if price is inside entry zone
-            in_zone = sig["entry_low"] <= price <= sig["entry_high"]
-
-            if in_zone:
-                opened = copy_execute(channel_key, sig, price, msg_id)
-                if opened:
-                    log_signal_event("EXECUTED", sym, channel_key,
-                                     "inside entry zone", f"price={price}")
-            else:
-                # Queue as pending — wait up to 2 hours
-                with state_lock:
-                    pending_signals[channel_key][sym] = {
-                        "sig":        sig,
-                        "msg_id":     msg_id,
-                        "expires_at": time.time() + COPY_SIGNAL_TTL,
-                        "created_at": time.time(),
-                    }
-                label = channel_label(channel_key)
-                side  = "LONG" if sig["direction"] == "BUY" else "SHORT"
-                above_below = "above" if price > sig["entry_high"] else "below"
-                log_signal_event("QUEUED", sym, channel_key,
-                                 f"price {price} {above_below} zone {sig['entry_low']}-{sig['entry_high']}")
-                tg_send(
-                    f"<b>⏳ COPY SIGNAL QUEUED — {sym}</b>\n"
-                    f"Source: {label}  |  {side}\n"
-                    f"Zone: {fmt_p(sig['entry_low'])} – {fmt_p(sig['entry_high'])}\n"
-                    f"Current price: {fmt_p(price)} ({above_below} zone)\n"
-                    f"<i>Waiting up to 2h for price to enter zone.</i>"
-                )
-                print(f"  ⏳ Queued {channel_key}/{sym} — waiting for zone entry")
+            copy_execute(channel_key, sig, price, msg_id)
 
         await client.run_until_disconnected()
 
@@ -1073,10 +850,9 @@ def start_telethon():
             loop.run_until_complete(_run())
         except Exception as e:
             print(f"  ❌ Telethon error: {e}")
-            tg_send(f"<b>❌ Copy Lab Telethon crashed</b>\n{e}")
+            tg_send(f"<b>❌ Copy Lab crashed</b>\n{e}")
 
-    t = threading.Thread(target=_thread, daemon=True)
-    t.start()
+    threading.Thread(target=_thread, daemon=True).start()
 
 
 # ─────────────────────────── MAIN ─────────────────────────────
@@ -1084,30 +860,29 @@ def run():
     print("=" * 55)
     print("  APEX COPY SIGNAL LAB — Phase 2.5")
     print("=" * 55)
-    print(f"Channels: {list(COPY_CHANNELS.keys())}")
-    print(f"Trade size: ${COPY_TRADE_SIZE} × {COPY_LEVERAGE}x")
-    print(f"Max per channel: {COPY_MAX_OPEN}")
-    print(f"Telethon: {'configured' if TG_SESSION else 'NOT CONFIGURED'}")
+    print(f"  Channels: {list(COPY_CHANNELS.keys())}")
+    print(f"  Trade:    ${COPY_TRADE_SIZE} x {COPY_LEVERAGE}x = ${COPY_TRADE_SIZE*COPY_LEVERAGE} exposure")
+    print(f"  Entry:    LIVE MARKET PRICE (ignores entry zone)")
+    print(f"  Telethon: {'configured' if TG_SESSION else 'NOT CONFIGURED'}")
 
     load_copy_history()
 
-    flask_thread = threading.Thread(target=start_flask, daemon=True)
-    flask_thread.start()
-    print(f"Dashboard: port {os.environ.get('PORT', 8081)}")
+    threading.Thread(target=start_flask, daemon=True).start()
+    print(f"  Dashboard: port {os.environ.get('PORT', 8081)}")
 
     start_telethon()
 
     tg_send(
         "<b>📡 APEX Copy Signal Lab — Online!</b>\n\n"
-        f"Monitoring: <b>{', '.join(channel_label(c) for c in COPY_CHANNELS)}</b>\n"
-        f"Trade size: <b>${COPY_TRADE_SIZE:.0f} × {COPY_LEVERAGE}x</b>\n"
-        f"Max trades/channel: <b>{COPY_MAX_OPEN}</b>\n\n"
+        f"Monitoring: <b>GGShot + Coin_Signals</b>\n"
+        f"Trade size: <b>${COPY_TRADE_SIZE:.0f} x {COPY_LEVERAGE}x</b> = "
+        f"<b>${COPY_TRADE_SIZE*COPY_LEVERAGE:.0f} exposure</b>\n"
+        f"Entry: <b>Live market price</b> (no zone waiting)\n"
+        f"Max per channel: <b>{COPY_MAX_OPEN}</b>\n\n"
         f"<b>Balances:</b>\n"
-        + "\n".join(
-            f"  {channel_label(ch)}: ${copy_balances[ch]:.2f}"
-            for ch in copy_balances
-        ) +
-        f"\n\n<b>Commands:</b> /copyreport /copypause /copyresume /copychannels\n\n"
+        + "\n".join(f"  {channel_label(ch)}: ${copy_balances[ch]:.2f}"
+                    for ch in copy_balances) +
+        f"\n\n<b>Commands:</b> /copyreport /copydebug /copypause /copyresume\n\n"
         f"<i>Paper only. No real money at risk.</i>"
     )
 
@@ -1116,13 +891,12 @@ def run():
         try:
             offset = check_copy_commands(offset)
             monitor_copy_positions()
-            check_pending_signals()
             time.sleep(10)
         except KeyboardInterrupt:
             print("\nCopy Lab stopped.")
             break
         except Exception as e:
-            print(f"Copy Lab error: {e}")
+            print(f"  Copy Lab error: {e}")
             time.sleep(10)
 
 
