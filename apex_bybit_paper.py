@@ -44,6 +44,7 @@ MIN_CONF           = 85        # Phase 2: back to 85 — proven best on 7-indica
 SCAN_EVERY_SECONDS = 30
 HTTP_TIMEOUT       = 15
 MAX_OPEN_TRADES    = 8         # Phase 2: 8 trades for faster data collection
+MAX_SAME_DIRECTION  = 4        # 4 per side → allows 8 total (4 longs + 4 shorts)
 
 SLIPPAGE_PCT       = 0.001
 FUNDING_RATE       = 0.0001
@@ -54,8 +55,6 @@ MIN_24H_VOLUME     = 300_000_000  # Skip coins with <$300M 24h volume
 
 # ── Phase 2 additions ──
 SL_COOLDOWN_SECONDS = 7200    # 2h cooldown after any SL hit per coin
-TRADE_HOUR_START    = 7       # Only trade 07:00-23:00 UTC
-TRADE_HOUR_END      = 23      # Avoids low-volume Asian session losses
 
 BLOCKED_COINS = {
     # Liquidated us - extreme gap risk
@@ -77,8 +76,7 @@ MAX_DAILY_LOSS_PCT  = 0.06   # 6% daily loss limit — tighter than 8%, allows 6
 MAX_CONSEC_LOSSES   = 3      # Pause after 3 consecutive SL hits
 MAX_TRADE_HOURS     = 48     # Force-close positions open > 48 hours
 BTC_CRASH_PCT       = -5.0   # Pause new signals if BTC drops >5% in 1h
-MAX_SAME_DIRECTION  = 3      # Phase 1 speed-up: max 3 SHORTs + 3 LONGs at any time
-MIN_FREE_CASH_PCT   = 0.30   # 30% free cash floor — allows 6 × $100 on $2,000
+MIN_FREE_CASH_PCT   = 0.30   # 30% free cash floor — allows 8 × $100 on $2,000
 
 # ─────────────────────────── STATE ────────────────────────────
 # RLock: reentrant - make_tp_msg/make_sl_msg re-acquire inside monitor_positions
@@ -1508,6 +1506,9 @@ def monitor_positions(prices):
                 stats["total"]     += 1
                 stats["sl_hit"]    += 1
                 risk_state["consec_losses"] += 1
+                # Phase 2: start cooldown for GAP_SL as well
+                sl_cooldown[sym] = time.time()
+                print(f"  ⏳ {sym} GAP_SL cooldown started — blocked 2h")
                 stats["pnl_history"].append(round(paper_balance, 2))
                 stats["trades_list"].append({
                     "sym": sym, "direction": direction,
@@ -1619,6 +1620,73 @@ def monitor_positions(prices):
 
 
 # ─────────────────────────── MAIN ─────────────────────────────
+def close_stale_position(sym, pos, scan_prices):
+    """Close a stale position using current live price and book accurate P&L."""
+    global paper_balance
+    coin_data = next((c for c in COINS if c["symbol"] == sym), None)
+    if not coin_data:
+        return
+    d = scan_prices.get(coin_data["id"]) or {}
+    live_price = d.get("usd")
+    if not live_price:
+        live_price = pos.get("exec_price", 0)
+
+    with state_lock:
+        # Re‑check existence inside lock
+        if sym not in positions:
+            return
+        pos = positions[sym]   # re‑read under lock
+        direction  = pos["direction"]
+        exec_price = pos["exec_price"]
+        tp_hit     = pos["tp_hit"]
+        rem_pct    = 1.0 - (tp_hit * 0.25)
+        trade_size = pos["margin"]
+        remaining_margin = trade_size * rem_pct
+
+        # Calculate unrealized P&L on the remaining position only
+        if exec_price > 0:
+            if direction == "BUY":
+                move_pct = (live_price - exec_price) / exec_price * 100
+            else:
+                move_pct = (exec_price - live_price) / exec_price * 100
+            unrealized_pnl = round(trade_size * LEVERAGE * move_pct / 100 * rem_pct, 2)
+        else:
+            unrealized_pnl = 0.0
+
+        prior_realized = pos.get("currentPnl", 0)
+        total_trade_pnl = round(prior_realized + unrealized_pnl, 2)
+
+        # Only add the unrealized part to stats (prior TP profits already counted)
+        if unrealized_pnl >= 0:
+            stats["profit_usdt"] += unrealized_pnl
+        else:
+            stats["loss_usdt"] += abs(unrealized_pnl)
+
+        # Return remaining margin + unrealized profit/loss
+        paper_balance += remaining_margin + unrealized_pnl
+
+        stats["total"] += 1
+        stats["trades_list"].append({
+            "sym": sym,
+            "direction": direction,
+            "result": "STALE_CLOSE",
+            "pnl": total_trade_pnl,
+            "time": utc_now_str(),
+        })
+        positions.pop(sym, None)
+
+        # Build message (outside lock but using the now‑cleaned state)
+        age_h = (time.time() - pos["opened_at"]) / 3600
+        sign  = "+" if total_trade_pnl >= 0 else ""
+        tg_send(
+            f"<b>⏰ STALE TRADE CLOSED - {sym}</b>\n"
+            f"Position open: {age_h:.1f}h (max {MAX_TRADE_HOURS}h)\n"
+            f"Final price: {fmt_p(live_price)}\n"
+            f"Trade P&L: {sign}${total_trade_pnl:.2f}\n"
+            f"Balance: ${paper_balance:.2f}"
+        )
+
+
 def run():
     # FIX: declare all mutable globals so pruning updates the real objects
     global paper_balance, pre_warned, last_signal
@@ -1659,7 +1727,6 @@ def run():
         f"<b>🔧 Phase 2 Fixes:</b>\n"
         f"• 30 whitelist coins only (proven winners)\n"
         f"• SL cooldown 2h — stops re-entry bug\n"
-        f"• Time filter {TRADE_HOUR_START:02d}:00-{TRADE_HOUR_END:02d}:00 UTC only\n"
         f"• GAP SL + ATR cap + is_sl_safe\n\n"
         f"<b>🛡️ Risk:</b> {MAX_DAILY_LOSS_PCT*100:.0f}% daily loss | {MAX_CONSEC_LOSSES} consec SL | BTC crash guard\n\n"
         f"<b>📊 Commands:</b> /report /r /pause /resume /help\n\n"
@@ -1706,46 +1773,24 @@ def run():
                 coin_syms   = {c["symbol"] for c in COINS}
                 last_signal = {k: v for k, v in last_signal.items() if k in coin_syms}
                 # FIX: trim pnl_history in-place so RAM never grows unbounded
-                if len(stats["pnl_history"]) > 600:
-                    stats["pnl_history"] = stats["pnl_history"][-500:]
+                with state_lock:   # thread‑safe truncation
+                    if len(stats["pnl_history"]) > 600:
+                        stats["pnl_history"] = stats["pnl_history"][-500:]
 
-                # ── Check for stale positions (open > MAX_TRADE_HOURS) ──
-                stale_syms = check_stale_positions()
-                for sym in stale_syms:
-                    stale_msg = None
-                    with state_lock:
-                        pos = positions.get(sym)
-                        if not pos:
-                            continue
-                        age_h     = (time.time() - pos.get("opened_at", time.time())) / 3600
-                        rem_pct   = 1.0 - (pos.get("tp_hit", 0) * 0.25)
-                        pnl_snap  = pos.get("currentPnl", 0)
-                        paper_balance += pos.get("margin", TRADE_SIZE) * rem_pct
-                        stats["total"]      += 1
-                        stats["trades_list"].append({
-                            "sym": sym, "direction": pos.get("direction",""),
-                            "result": "STALE_CLOSE",
-                            "pnl": round(pnl_snap, 2),
-                            "time": utc_now_str(),
-                        })
-                        positions.pop(sym, None)
-                        # Build message inside lock (reads balance), send outside
-                        stale_msg = (
-                            f"<b>⏰ STALE TRADE CLOSED - {sym}</b>\n\n"
-                            f"Position open for {age_h:.1f}h (max {MAX_TRADE_HOURS}h)\n"
-                            f"Realised P&L: +${pnl_snap:.2f} USDT\n\n"
-                            f"<i>Auto-closed to free capital.</i>"
-                        )
-                    # Send TG outside lock - no HTTP while holding state_lock
-                    if stale_msg:
-                        tg_send(stale_msg)
-
+                # Fetch fresh prices once, then close stale positions with accurate P&L
                 scan_prices = get_prices()
                 if not scan_prices:
                     time.sleep(2)
                     continue
 
                 prices = scan_prices
+
+                # ── Check for stale positions (open > MAX_TRADE_HOURS) ──
+                stale_syms = check_stale_positions()
+                for sym in stale_syms:
+                    pos_snapshot = positions.get(sym)
+                    if pos_snapshot:
+                        close_stale_position(sym, pos_snapshot, scan_prices)
 
                 # ── Circuit breaker check ──
                 paused = check_circuit_breakers(scan_prices)
@@ -1754,18 +1799,10 @@ def run():
                     time.sleep(2)
                     continue
 
-                # ── Phase 2: Time of day filter ──
-                current_hour = datetime.now(timezone.utc).hour
-                if not (TRADE_HOUR_START <= current_hour < TRADE_HOUR_END):
-                    print(f"  🕐 Outside trading hours ({current_hour:02d}:00 UTC) — skipping scan")
-                    time.sleep(2)
-                    continue
-
                 # ── Phase 2: Prune expired SL cooldowns ──
                 now_ts = time.time()
-                sl_cooldown_copy = dict(sl_cooldown)
-                for sym_cd, ts_cd in sl_cooldown_copy.items():
-                    if now_ts - ts_cd >= SL_COOLDOWN_SECONDS:
+                for sym_cd in list(sl_cooldown.keys()):
+                    if now_ts - sl_cooldown[sym_cd] >= SL_COOLDOWN_SECONDS:
                         sl_cooldown.pop(sym_cd, None)
                         print(f"  ✅ {sym_cd} cooldown expired — available again")
 
