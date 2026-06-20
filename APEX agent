@@ -1,0 +1,250 @@
+"""
+APEX AI Agent — Phase 2.6
+==========================
+Hourly Claude-powered analysis of the APEX v3 bot's open trades.
+
+What it does each hour:
+  1. Reads bybit-v3 /data endpoint (open positions, P&L, history)
+  2. Fetches live market data (price, Supertrend, volume) per open coin
+  3. Asks Claude to analyse each open trade
+  4. Sends recommendations to Telegram
+  5. AUTO-CLOSE: if Claude flags a clear reversal, calls the bot's
+     /agent_close endpoint to close that trade (paper only)
+
+Railway env vars required:
+  ANTHROPIC_API_KEY   — your Claude API key
+  TELEGRAM_TOKEN      — same Telegram bot
+  TELEGRAM_CHAT_ID    — same chat
+  BOT_DATA_URL        — e.g. https://bybit-v3.up.railway.app
+  AGENT_TOKEN         — shared secret, must match bot (default apex-secret)
+"""
+
+import os, time, json, requests
+from datetime import datetime, timezone
+
+# ── CONFIG ──
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+TG_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TG_CHAT   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+BOT_URL   = os.environ.get("BOT_DATA_URL", "").rstrip("/")
+AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "apex-secret").strip()
+
+ANALYZE_EVERY = 3600        # 1 hour
+AUTO_CLOSE    = True        # agent can close trades it flags as reversing
+MODEL         = "claude-sonnet-4-6"
+
+session = requests.Session()
+
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+def tg_send(msg):
+    if not TG_TOKEN or not TG_CHAT:
+        print("TG:", msg[:120]); return
+    try:
+        session.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id":TG_CHAT,"text":msg,"parse_mode":"HTML","disable_web_page_preview":True},
+            timeout=15)
+    except Exception as e:
+        print("TG error:", e)
+
+# ── DATA FETCHING ──
+def get_bot_data():
+    """Read the bot's /data endpoint."""
+    try:
+        r = session.get(f"{BOT_URL}/data", timeout=15)
+        return r.json()
+    except Exception as e:
+        print("bot data error:", e); return None
+
+def get_candles(symbol_usdt, interval="1h", limit=100):
+    try:
+        r = session.get("https://api.binance.com/api/v3/klines",
+            params={"symbol":symbol_usdt,"interval":interval,"limit":limit}, timeout=10)
+        data = r.json()
+        if not isinstance(data, list): return None
+        return [{"high":float(c[2]),"low":float(c[3]),"close":float(c[4]),"volume":float(c[5])} for c in data]
+    except Exception:
+        return None
+
+def calc_atr(candles, period=14):
+    if not candles or len(candles) < period+1: return None
+    trs=[]
+    for i in range(1,len(candles)):
+        h,l,pc=candles[i]["high"],candles[i]["low"],candles[i-1]["close"]
+        trs.append(max(h-l,abs(h-pc),abs(l-pc)))
+    atr=sum(trs[:period])/period
+    for tr in trs[period:]:
+        atr=(atr*(period-1)+tr)/period
+    return atr
+
+def market_snapshot(symbol):
+    """Build a quick market read for one coin."""
+    c1h = get_candles(symbol+"USDT","1h",100)
+    c4h = get_candles(symbol+"USDT","4h",100)
+    if not c1h or not c4h:
+        return None
+    closes1 = [c["close"] for c in c1h]
+    vols1   = [c["volume"] for c in c1h]
+    # EMA20 vs EMA50 trend on 1h
+    def ema(vals,p):
+        if len(vals)<p: return None
+        k=2/(p+1); e=sum(vals[:p])/p
+        for v in vals[p:]: e=v*k+e*(1-k)
+        return e
+    ema20=ema(closes1,20); ema50=ema(closes1,50)
+    trend1h = "up" if (ema20 and ema50 and ema20>ema50) else "down"
+    # 4h trend
+    closes4=[c["close"] for c in c4h]
+    e20_4=ema(closes4,20); e50_4=ema(closes4,50)
+    trend4h = "up" if (e20_4 and e50_4 and e20_4>e50_4) else "down"
+    # volume: last candle vs 20-avg
+    recent_vol = vols1[-1]
+    avg_vol = sum(vols1[-20:])/20 if len(vols1)>=20 else sum(vols1)/len(vols1)
+    vol_state = "rising" if recent_vol>avg_vol else "falling"
+    return {
+        "price": closes1[-1],
+        "trend_1h": trend1h,
+        "trend_4h": trend4h,
+        "volume": vol_state,
+        "atr_pct": round((calc_atr(c1h) or 0)/closes1[-1]*100,2) if closes1[-1] else None,
+    }
+
+# ── CLAUDE ANALYSIS ──
+def ask_claude(open_positions, market_data, stats_summary):
+    """Send everything to Claude, get back per-trade recommendations."""
+    prompt = f"""You are a crypto trading risk analyst monitoring open paper-trading positions.
+
+CURRENT STATS:
+{stats_summary}
+
+OPEN POSITIONS:
+{json.dumps(open_positions, indent=2)}
+
+LIVE MARKET DATA (per coin):
+{json.dumps(market_data, indent=2)}
+
+For EACH open position, decide one of:
+- KEEP: trade is healthy, let it run
+- CLOSE: clear reversal signal, close now to protect gains/limit loss
+- WATCH: uncertain, flag for attention
+
+A position is a reversal candidate if: it is in profit but 4h trend flipped against it AND volume is falling, OR it is a losing long while both 1h and 4h trends are down.
+
+Respond ONLY with JSON, no other text:
+{{"recommendations":[{{"symbol":"XXX","action":"KEEP|CLOSE|WATCH","reason":"short reason under 12 words"}}],"market_summary":"one sentence on overall market"}}"""
+
+    try:
+        r = session.post("https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 1000,
+                "messages": [{"role":"user","content":prompt}],
+            }, timeout=40)
+        data = r.json()
+        text = "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
+        text = text.replace("```json","").replace("```","").strip()
+        return json.loads(text)
+    except Exception as e:
+        print("Claude error:", e)
+        return None
+
+def close_trade(symbol):
+    """Call the bot's agent_close endpoint."""
+    try:
+        r = session.post(f"{BOT_URL}/agent_close/{AGENT_TOKEN}/{symbol}", timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        print("close error:", e); return False
+
+# ── MAIN LOOP ──
+def run():
+    print("="*55)
+    print("  APEX AI AGENT — Phase 2.6")
+    print("="*55)
+    print(f"  Bot URL: {BOT_URL}")
+    print(f"  Auto-close: {AUTO_CLOSE}")
+    print(f"  Analyze every: {ANALYZE_EVERY}s")
+
+    if not ANTHROPIC_API_KEY:
+        print("  ⚠️ No ANTHROPIC_API_KEY set!")
+    if not BOT_URL:
+        print("  ⚠️ No BOT_DATA_URL set!")
+
+    tg_send(
+        f"<b>🤖 APEX AI Agent — Online!</b>\n\n"
+        f"Monitoring: <b>APEX v3</b>\n"
+        f"Analysis: <b>Claude every hour</b>\n"
+        f"Auto-close: <b>{'ON' if AUTO_CLOSE else 'OFF'}</b>\n\n"
+        f"I'll analyse open trades hourly and flag reversals."
+    )
+
+    while True:
+        try:
+            data = get_bot_data()
+            if not data:
+                print("No bot data, retrying in 60s")
+                time.sleep(60); continue
+
+            open_pos = data.get("openPositions", {})
+            if not open_pos:
+                print(f"[{utc_now()}] No open positions")
+                time.sleep(ANALYZE_EVERY); continue
+
+            # Build market snapshot per open coin
+            market_data = {}
+            for sym in open_pos.keys():
+                snap = market_snapshot(sym)
+                if snap: market_data[sym] = snap
+                time.sleep(0.3)
+
+            stats_summary = (
+                f"Balance ${data.get('balance',0):.0f}, "
+                f"WR {data.get('winRate',0)}%, "
+                f"Net P&L ${data.get('netPnl',0):.0f}, "
+                f"{data.get('totalTrades',0)} trades"
+            )
+
+            result = ask_claude(open_pos, market_data, stats_summary)
+            if not result:
+                time.sleep(ANALYZE_EVERY); continue
+
+            recs = result.get("recommendations", [])
+            mkt  = result.get("market_summary", "")
+
+            # Build Telegram report
+            lines = [f"<b>🤖 AGENT ANALYSIS — {utc_now()}</b>", "━"*20]
+            closed_any = []
+            for rec in recs:
+                sym = rec.get("symbol","?")
+                act = rec.get("action","WATCH")
+                rsn = rec.get("reason","")
+                icon = {"KEEP":"✅","CLOSE":"🔴","WATCH":"👀"}.get(act,"•")
+                lines.append(f"{icon} <b>{sym}</b>: {act}\n   {rsn}")
+                # Auto-close if flagged
+                if act == "CLOSE" and AUTO_CLOSE:
+                    if close_trade(sym):
+                        closed_any.append(sym)
+                        lines.append(f"   → closed by agent ✅")
+                    else:
+                        lines.append(f"   → close failed ⚠️")
+            if mkt:
+                lines.append("━"*20)
+                lines.append(f"📊 {mkt}")
+            tg_send("\n".join(lines))
+            print(f"[{utc_now()}] Analysed {len(recs)} positions, closed {len(closed_any)}")
+
+            time.sleep(ANALYZE_EVERY)
+
+        except KeyboardInterrupt:
+            print("Stopped."); break
+        except Exception as e:
+            print("Loop error:", e); time.sleep(120)
+
+if __name__ == "__main__":
+    run()
