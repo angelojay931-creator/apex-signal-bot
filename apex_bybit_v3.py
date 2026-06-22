@@ -213,8 +213,6 @@ COINS = [
     {"id":"litentry",           "symbol":"LIT",    "bybit":"LITUSDT"},
     {"id":"phala-network",      "symbol":"PHA",    "bybit":"PHAUSDT"},
     {"id":"superverse",         "symbol":"SUPER",  "bybit":"SUPERUSDT"},
-    {"id":"bounce-token",       "symbol":"AUCTION","bybit":"AUCTIONUSDT"},
-    {"id":"alphalink",          "symbol":"ALPHA",  "bybit":"ALPHAUSDT"},
     {"id":"automata",           "symbol":"ATA",    "bybit":"ATAUSDT"},
     {"id":"gas",                "symbol":"GAS",    "bybit":"GASUSDT"},
     {"id":"joe",                "symbol":"JOE",    "bybit":"JOEUSDT"},
@@ -244,7 +242,6 @@ COINS = [
     {"id":"gains-network",      "symbol":"GNS",    "bybit":"GNSUSDT"},
     {"id":"spell-token",        "symbol":"SPELL",  "bybit":"SPELLUSDT"},
     {"id":"nkn",                "symbol":"NKN",    "bybit":"NKNUSDT"},
-    {"id":"worldcoin-wld",      "symbol":"WLD",    "bybit":"WLDUSDT"},
     {"id":"dent",               "symbol":"DENT",   "bybit":"DENTUSDT"},
     {"id":"ankr",               "symbol":"ANKR",   "bybit":"ANKRUSDT"},
     {"id":"uma",                "symbol":"UMA",    "bybit":"UMAUSDT"},
@@ -254,7 +251,6 @@ COINS = [
     {"id":"siacoin",            "symbol":"SC",     "bybit":"SCUSDT"},
     {"id":"iexec-rlc",          "symbol":"RLC",    "bybit":"RLCUSDT"},
     {"id":"cronos",             "symbol":"CRO",    "bybit":"CROUSDT"},
-    {"id":"woo-network",        "symbol":"WOO",    "bybit":"WOOUSDT"},
     {"id":"balancer",           "symbol":"BAL",    "bybit":"BALUSDT"},
     {"id":"ren",                "symbol":"REN",    "bybit":"RENUSDT"},
     {"id":"numeraire",          "symbol":"NMR",    "bybit":"NMRUSDT"},
@@ -272,16 +268,10 @@ COINS = [
     {"id":"cocos-bcx",          "symbol":"COCOS",  "bybit":"COCOSUSDT"},
     {"id":"ontology-gas",       "symbol":"ONG",    "bybit":"ONGUSDT"},
     {"id":"loom-network-new",   "symbol":"LOOM",   "bybit":"LOOMUSDT"},
-    {"id":"bluzelle",           "symbol":"BLZ",    "bybit":"BLZUSDT"},
     {"id":"unifi-protocol-dao", "symbol":"UNFI",   "bybit":"UNFIUSDT"},
     {"id":"boba-network",       "symbol":"BOBA",   "bybit":"BOBAUSDT"},
-    {"id":"wazirx",             "symbol":"WRX",    "bybit":"WRXUSDT"},
     {"id":"oraichain-token",    "symbol":"ORAI",   "bybit":"ORAIUSDT"},
     {"id":"biswap",             "symbol":"BSW",    "bybit":"BSWUSDT"},
-    {"id":"truefi",             "symbol":"TRU",    "bybit":"TRUUSDT"},
-    {"id":"stafi",              "symbol":"FIS",    "bybit":"FISUSDT"},
-    {"id":"dodo",               "symbol":"DODO",   "bybit":"DODOUSDT"},
-    {"id":"reef",               "symbol":"REEF",   "bybit":"REEFUSDT"},
 ]
 
 _seen = set()
@@ -818,7 +808,9 @@ def paper_execute(coin, sig, price):
         cap=paper_balance+sum(p.get("margin",0)*(1-p.get("tp_hit",0)*0.25) for p in positions.values())
         if (paper_balance-ts)/cap < MIN_FREE_CASH_PCT: return False
         if paper_balance < ts:
-            tg_send(f"<b>⚠️ Balance too low - {sym}</b>"); return False
+            _low_bal = True
+        else:
+            _low_bal = False
         sig_id=sig.get("sig_id",make_signal_id(sym))
         paper_balance -= ts
         stats["pnl_history"].append(round(paper_balance,2))
@@ -836,6 +828,9 @@ def paper_execute(coin, sig, price):
         }
         bal_after=paper_balance; oc=len(positions)
 
+    if _low_bal:
+        tg_send(f"<b>⚠️ Balance too low - {sym}</b>")
+        return False
     side="LONG" if direction=="BUY" else "SHORT"
     lev_ret=[round(p*LEVERAGE,1) for p in sig["tp_pcts"]]
     tg_send(f"<b>📝 PAPER TRADE - #{sig_id}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -927,7 +922,9 @@ def monitor_positions(prices):
                 notifications.append(f"<b>⚠️ GAP SL - {sym}</b>\nLoss:-${pnl:.2f}\nBal:${paper_balance:.2f}")
                 to_remove.append(sym); continue
 
-            if tp_hit>=4: to_remove.append(sym); continue
+            # ── PHASE 2.6: After TP4, trade stays open in RIDE MODE ──
+            # SL is at TP4 level, trail at 0.5×ATR — only closes on reversal
+            if tp_hit>=4 and not pos.get("ride_mode"): to_remove.append(sym); continue
 
             next_tp=tp_levels[tp_hit]
             tp_reached=(direction=="BUY" and price>=next_tp) or (direction=="SELL" and price<=next_tp)
@@ -950,11 +947,25 @@ def monitor_positions(prices):
                     pos["trail_mult"]=1.0  # tighten at TP3
                 pos["tp_hit"]=tp_num
                 if tp_num==4:
-                    stats["total"]+=1; stats["trades_won"]+=1; risk_state["consec_losses"]=0
-                    stats["trades_list"].append({"sym":sym,"direction":direction,"result":"ALL_TP","pnl":round(pos["currentPnl"],2),"time":utc_now_str()})
-                    total=stats["total"]; tw=stats["trades_won"]; wr=round(tw/total*100,1)
-                    notifications.append(f"<b>🎯 ALL 4 TPs HIT - {sym}!</b>\nTrade P&L: +${pos['currentPnl']:.2f}\nWR:{tw}/{total}={wr}%\nBal:${paper_balance:.2f}")
-                    to_remove.append(sym)
+                    # ── PHASE 2.6: RIDE MODE — don't close, keep riding the trend ──
+                    # SL moves to TP4 price, trail tightens to 0.5× ATR
+                    # Trade stays open until trail hit or agent flags reversal
+                    new_sl = next_tp   # SL = TP4 price (guaranteed profit locked)
+                    pos["sl"]              = new_sl
+                    pos["trail_mult"]      = 0.5    # tightest trail
+                    pos["trailing_active"] = True
+                    pos["ride_mode"]       = True   # flag so agent knows
+                    total=stats["total"]; tw=stats["trades_won"]; wr=round(tw/total*100,1) if total>0 else 0
+                    notifications.append(
+                        f"<b>🚀 ALL 4 TPs HIT — RIDE MODE ON — {sym}!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Trade P&L so far: +${pos['currentPnl']:.2f}\n"
+                        f"SL locked at TP4: {fmt_p(new_sl)}\n"
+                        f"Trail: 0.5× ATR (tightest)\n\n"
+                        f"🎯 Riding the trend — closes on reversal\n"
+                        f"Agent monitoring every 15 min\n\n"
+                        f"WR:{tw}/{total}={wr}% | Bal:${paper_balance:.2f}"
+                    )
                 else:
                     notifications.append(make_tp_msg(sym,direction,tp_num,entry,exec_price,next_tp,elapsed,pnl,new_sl,sig_id=pos.get("sig_id"),tp_hit_total=tp_num,trade_pnl_so_far=pos.get("currentPnl",0)))
 
@@ -981,9 +992,11 @@ def close_stale_position(sym, pos, scan_prices):
         else:       stats["loss_usdt"]+=abs(upnl)
         paper_balance+=rm+upnl; stats["total"]+=1
         stats["trades_list"].append({"sym":sym,"direction":direction,"result":"STALE_CLOSE","pnl":total_pnl,"time":utc_now_str()})
-        positions.pop(sym,None)
         age=f"{(time.time()-pos['opened_at'])/3600:.1f}h"
-        tg_send(f"<b>⏰ STALE CLOSE - {sym}</b>\nOpen: {age}\nP&L: {'+' if total_pnl>=0 else ''}${total_pnl:.2f}\nBal:${paper_balance:.2f}")
+        positions.pop(sym,None)
+        _stale_msg = f"<b>⏰ STALE CLOSE - {sym}</b>\nOpen: {age}\nP&L: {'+' if total_pnl>=0 else ''}${total_pnl:.2f}\nBal:${paper_balance:.2f}"
+
+    tg_send(_stale_msg)
 
 # ═══════════════════════════════════════════════════════════════════
 # PHASE 2.6 ONLY — AI AGENT
@@ -1040,18 +1053,26 @@ def agent_close_position(sym, prices, reason="reversal"):
         paper_balance+=rm+upnl
         stats["total"]+=1
 
-        # ── FIX: WR based on total_pnl not just upnl ──
-        if total_pnl>=0:
-            stats["trades_won"]+=1
-            risk_state["consec_losses"]=0
+        # Determine result type
+        was_ride = pos.get("ride_mode", False)
+        result_type = "RIDE_CLOSE" if was_ride else "AGENT_CLOSE"
+
+        # ── FIX: WR based on total_pnl ──
+        if total_pnl >= 0:
+            stats["trades_won"] += 1
+            risk_state["consec_losses"] = 0
         else:
-            risk_state["consec_losses"]+=1
-            sl_cooldown[sym]=time.time()  # SL cooldown on losing agent close
+            risk_state["consec_losses"] += 1
+            sl_cooldown[sym] = time.time()
+
+        # Ride mode: count as completed trade
+        if was_ride:
+            stats["total"] += 1
 
         stats["pnl_history"].append(round(paper_balance,2))
         stats["trades_list"].append({
             "sym":sym,"direction":direction,
-            "result":"AGENT_CLOSE","pnl":total_pnl,"time":utc_now_str()
+            "result":result_type,"pnl":total_pnl,"time":utc_now_str()
         })
         positions.pop(sym,None)
 
@@ -1081,11 +1102,19 @@ MARKET DATA (trend_1h, trend_4h, volume):
 
 RULES — follow strictly:
 
+RIDE MODE positions (ride_mode=true, all 4 TPs already hit):
+  These are big trend trades — highest priority
+  CLOSE immediately if EITHER is true:
+    1. trend_1h OR trend_4h reverses against direction
+    2. volume turns falling AND unrealized_pnl > 15
+  Otherwise KEEP — these are the maximum profit trades
+  Act fast on these — every percent counts
+
 LOSING positions (unrealized_pnl < -5):
   CLOSE if trend_1h AND trend_4h both against direction
   WATCH if only one timeframe against
 
-WINNING positions (unrealized_pnl >= 0):
+WINNING positions (unrealized_pnl >= 0, not ride mode):
   KEEP always — trailing stop protects profits
   Only CLOSE if ALL true:
     1. BOTH trend_1h AND trend_4h reversed against position
@@ -1126,12 +1155,13 @@ def agent_loop(get_prices_fn):
             with state_lock:
                 open_syms=list(positions.keys())
                 open_snapshot={s:{
-                    "direction":positions[s]["direction"],
-                    "entry":positions[s]["exec_price"],
-                    "tp_hit":positions[s]["tp_hit"],
+                    "direction":     positions[s]["direction"],
+                    "entry":         positions[s]["exec_price"],
+                    "tp_hit":        positions[s]["tp_hit"],
                     "unrealized_pnl":positions[s].get("unrealized_pnl",0),
                     "trailing_active":positions[s].get("trailing_active",False),
-                    "breakeven":positions[s].get("breakeven",False),
+                    "breakeven":     positions[s].get("breakeven",False),
+                    "ride_mode":     positions[s].get("ride_mode",False),  # ← big trade flag
                 } for s in open_syms}
             if not open_syms: time.sleep(AGENT_INTERVAL); continue
 
@@ -1166,31 +1196,74 @@ def agent_loop(get_prices_fn):
             print(f"agent loop error:{e}"); time.sleep(180)
 
 def agent_loss_monitor(get_prices_fn):
-    """Fast 15-min check: if loss > $8 and both TFs against → close immediately. No Claude call."""
+    """
+    Fast monitor — two jobs:
+    1. Losing trades (< -$8): check every 15 min, close if both TFs against
+    2. Ride mode trades (all 4 TPs hit): check every 5 min, close on ANY trend reversal
+    """
     if not AGENT_ENABLED: return
     time.sleep(300)
-    print("  ⚡ Fast loss monitor started (15 min)")
+    print("  ⚡ Fast loss + ride mode monitor started")
+    last_ride_check = 0
     while True:
         try:
+            now = time.time()
+            prices = None
+
+            # ── Ride mode check every 5 min ──
+            if now - last_ride_check >= 300:
+                last_ride_check = now
+                with state_lock:
+                    riding = {s:dict(p) for s,p in positions.items()
+                              if p.get("ride_mode", False)}
+                if riding:
+                    prices = prices or get_prices_fn()
+                    if prices:
+                        for sym, pos in riding.items():
+                            snap = agent_snapshot(sym)
+                            if not snap: continue
+                            d   = pos["direction"]
+                            t1  = snap["trend_1h"]
+                            t4  = snap["trend_4h"]
+                            vol = snap["volume"]
+                            upnl = pos.get("unrealized_pnl", 0)
+                            # Close ride mode if EITHER timeframe reverses
+                            should_close = (
+                                (d == "BUY"  and (t1 == "down" or t4 == "down")) or
+                                (d == "SELL" and (t1 == "up"   or t4 == "up"))
+                            )
+                            if should_close:
+                                reason = f"trend reversal detected, locking profit"
+                                if agent_close_position(sym, prices, reason):
+                                    tg_send(
+                                        f"<b>🏁 RIDE MODE CLOSE - {sym}</b>\n"
+                                        f"Trend reversed — locking maximum profit\n"
+                                        f"Unrealized: +${upnl:.2f}\n"
+                                        f"1h: {t1} | 4h: {t4}"
+                                    )
+
+            # ── Loss monitor every 15 min ──
             with state_lock:
-                losing={s:dict(p) for s,p in positions.items()
-                        if p.get("unrealized_pnl",0)<AGENT_LOSS_THRESHOLD}
+                losing = {s:dict(p) for s,p in positions.items()
+                          if p.get("unrealized_pnl",0) < AGENT_LOSS_THRESHOLD
+                          and not p.get("ride_mode", False)}
             if losing:
-                prices=get_prices_fn()
+                prices = prices or get_prices_fn()
                 if prices:
-                    for sym,pos in losing.items():
-                        snap=agent_snapshot(sym)
+                    for sym, pos in losing.items():
+                        snap = agent_snapshot(sym)
                         if not snap: continue
-                        d=pos["direction"]; t1=snap["trend_1h"]; t4=snap["trend_4h"]
-                        upnl=pos.get("unrealized_pnl",0)
-                        should_close=(
-                            (d=="BUY"  and t1=="down" and t4=="down") or
-                            (d=="SELL" and t1=="up"   and t4=="up")
+                        d = pos["direction"]; t1 = snap["trend_1h"]; t4 = snap["trend_4h"]
+                        upnl = pos.get("unrealized_pnl", 0)
+                        should_close = (
+                            (d == "BUY"  and t1 == "down" and t4 == "down") or
+                            (d == "SELL" and t1 == "up"   and t4 == "up")
                         )
                         if should_close:
-                            reason=f"both TFs against {d}, loss ${upnl:.2f}"
-                            if agent_close_position(sym,prices,reason):
+                            reason = f"both TFs against {d}, loss ${upnl:.2f}"
+                            if agent_close_position(sym, prices, reason):
                                 tg_send(f"<b>⚡ FAST CLOSE - {sym}</b>\nLoss monitor\nU: ${upnl:.2f}\n1h:{t1} 4h:{t4}")
+
             time.sleep(AGENT_LOSS_INTERVAL)
         except Exception as e:
             print(f"loss monitor error:{e}"); time.sleep(300)
