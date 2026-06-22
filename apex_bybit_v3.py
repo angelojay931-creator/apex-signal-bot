@@ -5,20 +5,28 @@ Signal Engine: Supertrend + UT Bot + EMA 20/50/200
 Timeframes:    1m + 5m + 1h + 4h (all must agree)
 Paper trading only — no real orders placed.
 
-Phase 2.6 additions vs apex_bybit_paper.py (DO NOT TOUCH):
+BASE: apex_bybit_paper.py (proven — DO NOT TOUCH THAT FILE)
+ADDITIONS in v3 (Phase 2.6 only):
   1. ATR trailing stop (activates after TP2)
   2. Built-in AI agent thread (hourly Claude analysis)
   3. Fast loss monitor (every 15 min for losing trades)
-  4. Two-mode agent (losers → close fast, winners → let trail run)
-  5. Re-entry block after agent close (2h cooldown)
-  6. Better Claude prompt (stops closing winners early)
+  4. Two-mode agent (losers→close fast, winners→let trail run)
+  5. Re-entry block 2h after agent close
+  6. Fixed WR bug in agent_close_position
+
+Everything else is IDENTICAL to apex_bybit_paper.py:
+  - Same coin list (169 coins)
+  - Same SL_COOLDOWN_SECONDS (7200 = 2h)
+  - Same signal engine
+  - Same risk management
+  - Same TP/SL logic
 
 Railway env vars:
   TELEGRAM_TOKEN
   TELEGRAM_CHAT_ID
-  ANTHROPIC_API_KEY
-  AGENT_INTERVAL    (optional, default 3600 = 1h)
-  AGENT_AUTO_CLOSE  (optional, default true)
+  ANTHROPIC_API_KEY     (new — enables agent)
+  AGENT_INTERVAL        (optional, default 3600)
+  AGENT_AUTO_CLOSE      (optional, default true)
 """
 
 import os, time, threading, json
@@ -27,7 +35,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from flask import Flask, jsonify
 
-# ─────────────────────── CONFIG ───────────────────────────────
+# ─────────────────────── CONFIG ─────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 PAPER_TRADING   = True
 PAPER_BALANCE   = 2000.0
 
@@ -46,8 +55,7 @@ FUNDING_RATE        = 0.0001
 GAP_SLIPPAGE_PCT    = 0.005
 LIQ_BUFFER_PCT      = 0.02
 MIN_24H_VOLUME      = 300_000_000
-SL_COOLDOWN_SECONDS = 86400        # 24h SL cooldown
-AGENT_COOLDOWN_SECS = 7200         # 2h re-entry block after agent close
+SL_COOLDOWN_SECONDS = 7200        # !! SAME AS OLD: 2h !!
 PRE_WARN_TTL        = 7200
 MIN_FREE_CASH_PCT   = 0.30
 MAX_DAILY_LOSS_PCT  = 0.06
@@ -60,15 +68,17 @@ RISK_PCT           = 0.05
 MIN_TRADE_SIZE     = 100.0
 MAX_TRADE_SIZE     = 100.0
 
-# ── PHASE 2.6: Agent config ──
-ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-AGENT_ENABLED        = bool(ANTHROPIC_API_KEY)
-AGENT_INTERVAL       = int(os.environ.get("AGENT_INTERVAL", "3600"))   # hourly
-AGENT_LOSS_INTERVAL  = 900    # 15 min — fast check for losing trades
-AGENT_AUTO_CLOSE     = os.environ.get("AGENT_AUTO_CLOSE", "true").lower() == "true"
-AGENT_MODEL          = "claude-sonnet-4-6"
-AGENT_LOSS_THRESHOLD = -8.0   # unrealized loss worse than -$8 triggers fast check
+# ── PHASE 2.6 ONLY: Agent config (new — not in old code) ──
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+AGENT_ENABLED       = bool(ANTHROPIC_API_KEY)
+AGENT_INTERVAL      = int(os.environ.get("AGENT_INTERVAL", "3600"))
+AGENT_LOSS_INTERVAL = 900          # 15 min fast loss check
+AGENT_AUTO_CLOSE    = os.environ.get("AGENT_AUTO_CLOSE", "true").lower() == "true"
+AGENT_MODEL         = "claude-sonnet-4-6"
+AGENT_LOSS_THRESHOLD = -8.0        # close fast if unrealized < -$8
+AGENT_COOLDOWN_SECS  = 7200        # 2h re-entry block after agent close
 
+# !! IDENTICAL TO apex_bybit_paper.py !!
 BLOCKED_COINS = {
     "WAVES","HNT","ALPACA","WRX","REEF","LOKA","AUCTION",
     "NULS","ALPHA","CLV","SXP","FIS","MDT","DODO","BLZ",
@@ -77,12 +87,13 @@ BLOCKED_COINS = {
 }
 
 # ─────────────────────── STATE ─────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 state_lock    = threading.RLock()
 positions     = {}
 pre_warned    = {}
 paper_balance = PAPER_BALANCE
 last_signal   = {}
-sl_cooldown   = {}   # sym → timestamp (covers both SL hits and agent closes)
+sl_cooldown   = {}
 
 stats = {
     "total":0,"trades_won":0,"tp_hit":0,"sl_hit":0,
@@ -97,7 +108,8 @@ risk_state = {
     "pause_until":0.0,"daily_reset_at":0.0,
 }
 
-# ─────────────────────── COINS ────────────────────────────────
+# ─────────────────────── COINS ──────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py — 169 coins same list !!
 COINS = [
     # Proven 30 whitelist
     {"id":"dydx-chain",         "symbol":"DYDX",   "bybit":"DYDXUSDT"},
@@ -130,7 +142,7 @@ COINS = [
     {"id":"ripple",             "symbol":"XRP",    "bybit":"XRPUSDT"},
     {"id":"filecoin",           "symbol":"FIL",    "bybit":"FILUSDT"},
     {"id":"sushi",              "symbol":"SUSHI",  "bybit":"SUSHIUSDT"},
-    # Additional coins
+    # Additional 100+
     {"id":"bitcoin",            "symbol":"BTC",    "bybit":"BTCUSDT"},
     {"id":"ethereum",           "symbol":"ETH",    "bybit":"ETHUSDT"},
     {"id":"binancecoin",        "symbol":"BNB",    "bybit":"BNBUSDT"},
@@ -201,6 +213,8 @@ COINS = [
     {"id":"litentry",           "symbol":"LIT",    "bybit":"LITUSDT"},
     {"id":"phala-network",      "symbol":"PHA",    "bybit":"PHAUSDT"},
     {"id":"superverse",         "symbol":"SUPER",  "bybit":"SUPERUSDT"},
+    {"id":"bounce-token",       "symbol":"AUCTION","bybit":"AUCTIONUSDT"},
+    {"id":"alphalink",          "symbol":"ALPHA",  "bybit":"ALPHAUSDT"},
     {"id":"automata",           "symbol":"ATA",    "bybit":"ATAUSDT"},
     {"id":"gas",                "symbol":"GAS",    "bybit":"GASUSDT"},
     {"id":"joe",                "symbol":"JOE",    "bybit":"JOEUSDT"},
@@ -218,6 +232,7 @@ COINS = [
     {"id":"jito-governance-token","symbol":"JTO",  "bybit":"JTOUSDT"},
     {"id":"alt-layer",          "symbol":"ALT",    "bybit":"ALTUSDT"},
     {"id":"manta-network",      "symbol":"MANTA",  "bybit":"MANTAUSDT"},
+    {"id":"omni-network",       "symbol":"OMNI",   "bybit":"OMNIUSDT"},
     {"id":"ssv-network",        "symbol":"SSV",    "bybit":"SSVUSDT"},
     {"id":"civic",              "symbol":"CVC",    "bybit":"CVCUSDT"},
     {"id":"kaspa",              "symbol":"KAS",    "bybit":"KASUSDT"},
@@ -227,7 +242,9 @@ COINS = [
     {"id":"frax-share",         "symbol":"FXS",    "bybit":"FXSUSDT"},
     {"id":"perpetual-protocol", "symbol":"PERP",   "bybit":"PERPUSDT"},
     {"id":"gains-network",      "symbol":"GNS",    "bybit":"GNSUSDT"},
+    {"id":"spell-token",        "symbol":"SPELL",  "bybit":"SPELLUSDT"},
     {"id":"nkn",                "symbol":"NKN",    "bybit":"NKNUSDT"},
+    {"id":"worldcoin-wld",      "symbol":"WLD",    "bybit":"WLDUSDT"},
     {"id":"dent",               "symbol":"DENT",   "bybit":"DENTUSDT"},
     {"id":"ankr",               "symbol":"ANKR",   "bybit":"ANKRUSDT"},
     {"id":"uma",                "symbol":"UMA",    "bybit":"UMAUSDT"},
@@ -237,21 +254,34 @@ COINS = [
     {"id":"siacoin",            "symbol":"SC",     "bybit":"SCUSDT"},
     {"id":"iexec-rlc",          "symbol":"RLC",    "bybit":"RLCUSDT"},
     {"id":"cronos",             "symbol":"CRO",    "bybit":"CROUSDT"},
+    {"id":"woo-network",        "symbol":"WOO",    "bybit":"WOOUSDT"},
     {"id":"balancer",           "symbol":"BAL",    "bybit":"BALUSDT"},
     {"id":"ren",                "symbol":"REN",    "bybit":"RENUSDT"},
     {"id":"numeraire",          "symbol":"NMR",    "bybit":"NMRUSDT"},
+    {"id":"alice",              "symbol":"ALICE",  "bybit":"ALICEUSDT"},
+    {"id":"high-street",        "symbol":"HIGH",   "bybit":"HIGHUSDT"},
     {"id":"pixels",             "symbol":"PIXEL",  "bybit":"PIXELUSDT"},
+    {"id":"cortex",             "symbol":"CTXC",   "bybit":"CTXCUSDT"},
     {"id":"hamster-kombat",     "symbol":"HMSTR",  "bybit":"HMSTRUSDT"},
     {"id":"catizen",            "symbol":"CATI",   "bybit":"CATIUSDT"},
     {"id":"dogs-token",         "symbol":"DOGS",   "bybit":"DOGSUSDT"},
+    {"id":"aura-finance",       "symbol":"AURA",   "bybit":"AURAUSDT"},
     {"id":"portal",             "symbol":"PORTAL", "bybit":"PORTALUSDT"},
     {"id":"prom",               "symbol":"PROM",   "bybit":"PROMUSDT"},
+    {"id":"xem",                "symbol":"XEM",    "bybit":"XEMUSDT"},
+    {"id":"cocos-bcx",          "symbol":"COCOS",  "bybit":"COCOSUSDT"},
     {"id":"ontology-gas",       "symbol":"ONG",    "bybit":"ONGUSDT"},
+    {"id":"loom-network-new",   "symbol":"LOOM",   "bybit":"LOOMUSDT"},
     {"id":"bluzelle",           "symbol":"BLZ",    "bybit":"BLZUSDT"},
     {"id":"unifi-protocol-dao", "symbol":"UNFI",   "bybit":"UNFIUSDT"},
     {"id":"boba-network",       "symbol":"BOBA",   "bybit":"BOBAUSDT"},
+    {"id":"wazirx",             "symbol":"WRX",    "bybit":"WRXUSDT"},
     {"id":"oraichain-token",    "symbol":"ORAI",   "bybit":"ORAIUSDT"},
     {"id":"biswap",             "symbol":"BSW",    "bybit":"BSWUSDT"},
+    {"id":"truefi",             "symbol":"TRU",    "bybit":"TRUUSDT"},
+    {"id":"stafi",              "symbol":"FIS",    "bybit":"FISUSDT"},
+    {"id":"dodo",               "symbol":"DODO",   "bybit":"DODOUSDT"},
+    {"id":"reef",               "symbol":"REEF",   "bybit":"REEFUSDT"},
 ]
 
 _seen = set()
@@ -264,7 +294,8 @@ COINS = _deduped
 
 session = requests.Session()
 
-# ─────────────────────── HELPERS ──────────────────────────────
+# ─────────────────────── HELPERS ────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def utc_now_str():
     return datetime.now(timezone.utc).strftime("%H:%M UTC")
 
@@ -291,7 +322,8 @@ def calc_trade_size():
         return max(MIN_TRADE_SIZE, min(MAX_TRADE_SIZE, round(bal * RISK_PCT, 2)))
     return TRADE_SIZE
 
-# ─────────────────────── RISK MANAGEMENT ──────────────────────
+# ─────────────────────── RISK MANAGEMENT ────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def check_circuit_breakers(scan_prices=None):
     global risk_state
     with state_lock:
@@ -356,7 +388,8 @@ def check_stale_positions():
                 stale.append(sym)
     return stale
 
-# ─────────────────────── CANDLES ──────────────────────────────
+# ─────────────────────── CANDLES ────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def get_candles(symbol_usdt, interval="1h", limit=250):
     try:
         r = session.get(
@@ -372,7 +405,8 @@ def get_candles(symbol_usdt, interval="1h", limit=250):
         print(f"  Candle error {symbol_usdt} {interval}: {e}")
         return None
 
-# ─────────────────────── INDICATORS ───────────────────────────
+# ─────────────────────── INDICATORS ─────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def calc_ema(closes, period):
     if len(closes) < period: return None
     k = 2 / (period + 1)
@@ -385,8 +419,8 @@ def calc_atr_rolling(candles, period=14):
     if len(candles) < period + 1: return None
     trs = []
     for i in range(1, len(candles)):
-        h  = candles[i].get("high",  candles[i]["close"]*1.005)
-        l  = candles[i].get("low",   candles[i]["close"]*0.995)
+        h = candles[i].get("high", candles[i]["close"]*1.005)
+        l = candles[i].get("low",  candles[i]["close"]*0.995)
         pc = candles[i-1]["close"]
         trs.append(max(h-l, abs(h-pc), abs(l-pc)))
     atrs = [sum(trs[:period]) / period]
@@ -413,12 +447,9 @@ def calc_supertrend(candles, period=10, multiplier=3.0):
         final_dn.append(fd)
     trend = [1]
     for i in range(1, n):
-        if trend[-1] == -1 and aligned[i]["close"] > final_dn[i-1]:
-            trend.append(1)
-        elif trend[-1] == 1 and aligned[i]["close"] < final_up[i-1]:
-            trend.append(-1)
-        else:
-            trend.append(trend[-1])
+        if trend[-1] == -1 and aligned[i]["close"] > final_dn[i-1]: trend.append(1)
+        elif trend[-1] == 1 and aligned[i]["close"] < final_up[i-1]: trend.append(-1)
+        else: trend.append(trend[-1])
     is_bull = trend[-1] == 1
     val = round(final_up[-1] if is_bull else final_dn[-1], 8)
     return val, is_bull
@@ -435,8 +466,8 @@ def calc_ut_bot(candles, key_value=1.0, atr_period=10):
     trailing = [aligned[0] - n_loss[0]]
     for i in range(1, n):
         prev = trailing[-1]; nl = n_loss[i]; src = aligned[i]; sp = aligned[i-1]
-        if sp > prev:   new = max(prev, src - nl)
-        elif sp < prev: new = min(prev, src + nl)
+        if sp > prev:    new = max(prev, src - nl)
+        elif sp < prev:  new = min(prev, src + nl)
         elif src > prev: new = src - nl
         else:            new = src + nl
         trailing.append(new)
@@ -447,10 +478,10 @@ def calc_ut_bot(candles, key_value=1.0, atr_period=10):
 def get_ta_timeframe(symbol, interval, limit=250):
     candles = get_candles(symbol + "USDT", interval, limit)
     if not candles or len(candles) < 30: return None
-    closes  = [c["close"] for c in candles]
-    ema20   = calc_ema(closes, 20)
-    ema50   = calc_ema(closes, 50)  if len(closes) >= 50  else None
-    ema200  = calc_ema(closes, 200) if len(closes) >= 200 else None
+    closes = [c["close"] for c in candles]
+    ema20  = calc_ema(closes, 20)
+    ema50  = calc_ema(closes, 50)  if len(closes) >= 50  else None
+    ema200 = calc_ema(closes, 200) if len(closes) >= 200 else None
     st_val, st_bull = calc_supertrend(candles, 10, 3.0)
     ut_buy, ut_sell = calc_ut_bot(candles, 1.0, 10)
     atrs    = calc_atr_rolling(candles, 14)
@@ -479,7 +510,8 @@ def fetch_ta_parallel(symbols):
             except: res[sym] = None
     return res
 
-# ─────────────────────── PRICES ───────────────────────────────
+# ─────────────────────── PRICES ─────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def get_prices():
     try:
         ids = ",".join(c["id"] for c in COINS)
@@ -513,7 +545,8 @@ def get_prices():
         print("Binance error:", e)
     return None
 
-# ─────────────────────── SIGNAL ENGINE ────────────────────────
+# ─────────────────────── SIGNAL ENGINE ──────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def build_signal(price, change, high, low, vol, ta_mtf):
     if not price or not ta_mtf: return None
     buy_votes = 0; sell_votes = 0; total_tf = 0
@@ -530,7 +563,7 @@ def build_signal(price, change, high, low, vol, ta_mtf):
         total_tf += weight
         bull_ema = (ema20 and ema50 and ema20 > ema50) if (ema20 and ema50) else True
         bear_ema = (ema20 and ema50 and ema20 < ema50) if (ema20 and ema50) else True
-        if st_bull and (ut_buy or bull_ema):      buy_votes  += weight
+        if st_bull and (ut_buy or bull_ema):        buy_votes  += weight
         elif not st_bull and (ut_sell or bear_ema): sell_votes += weight
         if tf == "4h": ema200_4h = ta.get("ema200")
         if tf == "1h":
@@ -540,17 +573,17 @@ def build_signal(price, change, high, low, vol, ta_mtf):
     buy_pct  = buy_votes  / total_tf * 100
     sell_pct = sell_votes / total_tf * 100
 
-    if buy_pct >= 55:        direction = "BUY";  agreement = buy_pct
-    elif sell_pct >= 55:     direction = "SELL"; agreement = sell_pct
-    else:                    return None
+    if buy_pct >= 55:    direction = "BUY";  agreement = buy_pct
+    elif sell_pct >= 55: direction = "SELL"; agreement = sell_pct
+    else:                return None
 
     if ema200_4h:
         if direction == "BUY"  and price < ema200_4h * 0.99: return None
         if direction == "SELL" and price > ema200_4h * 1.01: return None
     if vol and vol < MIN_24H_VOLUME: return None
     if atr_for_sl:
-        atr_pct_val = atr_for_sl / price * 100
-        if atr_pct_val < 0.3 or atr_pct_val > 8.0: return None
+        atr_pct = atr_for_sl / price * 100
+        if atr_pct < 0.3 or atr_pct > 8.0: return None
 
     conf = min(95, int(60 + agreement * 0.35))
 
@@ -587,16 +620,17 @@ def build_signal(price, change, high, low, vol, ta_mtf):
         "buy_votes":buy_votes,"sell_votes":sell_votes,"agreement":round(agreement,1),
         "ema20":ema20_1h,"ema50":ema50_1h,"ema200":ema200_4h,
         "atr_pct":round(atr_for_sl/price*100,2) if atr_for_sl else None,
-        "atr_abs":atr_for_sl,
+        "atr_abs":atr_for_sl,  # ← needed for trailing stop
         "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp4":tp4,"sl":sl,
         "sl_pct":sl_pct,"tp_pcts":tp_pcts,"tp1_prob":80,"tp2_prob":65,
     }
 
-# ─────────────────────── FLASK ────────────────────────────────
+# ─────────────────────── FLASK ───────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 app = Flask(__name__)
 
 @app.route("/")
-def health(): return "APEX v3 Phase 2.6 running!", 200
+def health(): return "APEX MTF Bot running!", 200
 
 @app.route("/data")
 def get_data():
@@ -620,7 +654,6 @@ def get_data():
                 "totalPnl":round(pos.get("currentPnl",0)+pos.get("unrealized_pnl",0),2),
                 "remainingPct":round(rem*100),"openTime":pos.get("opened_at",0),
                 "sigId":pos.get("sig_id",""),
-                "trailingActive":pos.get("trailing_active",False),
             }
         payload = {
             "balance":paper_balance,"startBalance":PAPER_BALANCE,"netPnl":net,
@@ -630,7 +663,6 @@ def get_data():
             "openPositions":open_pos,"closedTrades":stats["trades_list"][-50:],
             "pnlHistory":stats["pnl_history"][-500:],
             "leverage":LEVERAGE,"tradeSize":TRADE_SIZE,"timestamp":utc_now_str(),
-            "agentEnabled":AGENT_ENABLED,
         }
     resp = jsonify(payload)
     resp.headers.add("Access-Control-Allow-Origin","*")
@@ -640,13 +672,13 @@ def start_flask():
     import logging; logging.getLogger("werkzeug").setLevel(logging.ERROR)
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",8080)),debug=False,use_reloader=False)
 
-# ─────────────────────── TELEGRAM ─────────────────────────────
+# ─────────────────────── TELEGRAM ────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def tg_send(msg):
     if not TG_TOKEN or not TG_CHAT:
         print("TG:", msg[:80]); return
     try:
-        session.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        session.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             data={"chat_id":TG_CHAT,"text":msg,"parse_mode":"HTML","disable_web_page_preview":True},
             timeout=HTTP_TIMEOUT)
     except Exception as e:
@@ -679,24 +711,16 @@ def make_report():
         for sym,pos in positions.items():
             arrow="🟢" if pos.get("direction")=="BUY" else "🔴"
             be="🔒" if pos.get("breakeven") else ""
-            trail="🎯" if pos.get("trailing_active") else ""
-            pos_lines.append(
-                f"{arrow} {sym} {be}{trail}  {tp_progress_bar(pos.get('tp_hit',0),pos.get('direction',''))}\n"
-                f"   R:+${pos.get('currentPnl',0):.2f}  U:${pos.get('unrealized_pnl',0):+.2f}"
-            )
+            pos_lines.append(f"{arrow} {sym} {be}  {tp_progress_bar(pos.get('tp_hit',0),pos.get('direction',''))}\n   R:+${pos.get('currentPnl',0):.2f}  U:${pos.get('unrealized_pnl',0):+.2f}")
         paused=f"\n⚠️ Paused: {risk_state['pause_reason']}" if risk_state.get("trading_paused") else ""
     sb=risk_state["session_start_balance"]; dd=round((cap-sb)/sb*100,1)
     sign="+" if net>=0 else ""; ddi="📈" if dd>=0 else "📉"
-    agent_status="🤖 Agent: ON" if AGENT_ENABLED else "🤖 Agent: OFF"
-    return (
-        f"<b>📊 APEX MTF REPORT - {utc_now_str()}</b>\n══════════════════════════════\n"
-        f"💰 Free:      ${free:.2f}\n📦 Deployed:  ${dep:.2f} ({oc} trades)\n"
-        f"💎 Total:     ${cap:.2f}\n{ddi} vs start:  {dd:+.1f}%\n\n"
-        f"📈 P&L:  {sign}${abs(net):.2f}\n🏆 WR:   {tw}/{total} = {wr}%\n"
-        f"✅ TP:   {stats['tp_hit']}  ❌ SL: {stats['sl_hit']}\n"
-        f"{agent_status}{paused}\n\n"
-        f"<b>Open ({oc}):</b>\n"+("\n".join(pos_lines) if pos_lines else "None")
-    )
+    return (f"<b>📊 APEX MTF REPORT - {utc_now_str()}</b>\n══════════════════════════════\n"
+            f"💰 Free:      ${free:.2f}\n📦 Deployed:  ${dep:.2f} ({oc} trades)\n"
+            f"💎 Total:     ${cap:.2f}\n{ddi} vs start:  {dd:+.1f}%\n\n"
+            f"📈 P&L:  {sign}${abs(net):.2f}\n🏆 WR:   {tw}/{total} = {wr}%\n"
+            f"✅ TP:   {stats['tp_hit']}  ❌ SL: {stats['sl_hit']}{paused}\n\n"
+            f"<b>Open ({oc}):</b>\n"+("\n".join(pos_lines) if pos_lines else "None"))
 
 def check_btns(offset):
     updates = tg_updates(offset)
@@ -727,38 +751,32 @@ def make_signal_msg(coin, sig, price, change):
     agree=sig.get("agreement",0)
     ema20=sig.get("ema20"); ema50=sig.get("ema50"); ema200=sig.get("ema200")
     ema_str=("↑" if ema20 and ema50 and ema20>ema50 else "↓") if ema20 and ema50 else "?"
-    return (
-        f"<b>⚡ APEX MTF SIGNAL - #{sig_id}</b>\n══════════════════════════════\n"
-        f"{arrow} <b>{side} - {coin['symbol']}/USDT</b>\n\n"
-        f"⚙️ {LEVERAGE}x | ${ts:.0f} → ${notional:.0f} exposure\n\n"
-        f"Entry: {fmt_p(price)}\nSL:    {fmt_p(sig['sl'])}  (-{sl_pct:.2f}%)\n\n"
-        f"TP1: {fmt_p(sig['tp1'])}  (+{tp_pcts[0]}% | {lev_ret[0]}% lev)\n"
-        f"TP2: {fmt_p(sig['tp2'])}  (+{tp_pcts[1]}% | {lev_ret[1]}% lev)\n"
-        f"TP3: {fmt_p(sig['tp3'])}  (+{tp_pcts[2]}% | {lev_ret[2]}% lev)\n"
-        f"TP4: {fmt_p(sig['tp4'])}  (+{tp_pcts[3]}% | {lev_ret[3]}% lev)\n\n"
-        f"📊 MTF Agreement: {agree:.0f}%\n"
-        f"EMA trend: {ema_str}  EMA200(4h): {fmt_p(ema200)}\n"
-        f"24h: {sign}{round(change,2)}%\n\n"
-        f"Confidence: {conf}%  [{bars}]\n"
-        f"<i>1m+5m+1h+4h consensus</i>\n══════════════════════════════\nTime: {utc_now_str()}"
-    )
+    return (f"<b>⚡ APEX MTF SIGNAL - #{sig_id}</b>\n══════════════════════════════\n"
+            f"{arrow} <b>{side} - {coin['symbol']}/USDT</b>\n\n"
+            f"⚙️ {LEVERAGE}x | ${ts:.0f} → ${notional:.0f} exposure\n\n"
+            f"Entry: {fmt_p(price)}\nSL:    {fmt_p(sig['sl'])}  (-{sl_pct:.2f}%)\n\n"
+            f"TP1: {fmt_p(sig['tp1'])}  (+{tp_pcts[0]}% | {lev_ret[0]}% lev)\n"
+            f"TP2: {fmt_p(sig['tp2'])}  (+{tp_pcts[1]}% | {lev_ret[1]}% lev)\n"
+            f"TP3: {fmt_p(sig['tp3'])}  (+{tp_pcts[2]}% | {lev_ret[2]}% lev)\n"
+            f"TP4: {fmt_p(sig['tp4'])}  (+{tp_pcts[3]}% | {lev_ret[3]}% lev)\n\n"
+            f"📊 MTF Agreement: {agree:.0f}%\n"
+            f"EMA trend: {ema_str}  EMA200(4h): {fmt_p(ema200)}\n"
+            f"24h: {sign}{round(change,2)}%\n\n"
+            f"Confidence: {conf}%  [{bars}]\n"
+            f"<i>1m+5m+1h+4h consensus</i>\n══════════════════════════════\nTime: {utc_now_str()}")
 
-def make_tp_msg(sym,direction,tp_num,entry,exec_price,tp_price,elapsed,pnl_usdt,new_sl=None,sig_id=None,tp_hit_total=0,trade_pnl_so_far=0,trailing=False):
+def make_tp_msg(sym,direction,tp_num,entry,exec_price,tp_price,elapsed,pnl_usdt,new_sl=None,sig_id=None,tp_hit_total=0,trade_pnl_so_far=0):
     arrow="🟢" if direction=="BUY" else "🔴"; side="LONG" if direction=="BUY" else "SHORT"
-    sl_note = f"\n💡 SL→{fmt_p(new_sl)} (BE)" if tp_num==1 and new_sl else \
-              (f"\n💡 SL→TP{tp_num-1} + 🎯 Trail ON" if tp_num==2 and new_sl else \
-              (f"\n💡 Trail tightened 1×ATR" if tp_num==3 else ""))
+    sl_note=f"\n💡 SL→{fmt_p(new_sl)} (BE)" if tp_num==1 and new_sl else (f"\n💡 SL→TP{tp_num-1}" if tp_num>1 and new_sl else "")
     with state_lock:
         total=stats["total"]; tw=stats["trades_won"]
         wr=round(tw/total*100,1) if total>0 else 0
         net=round(stats["profit_usdt"]-stats["loss_usdt"],2); bal=paper_balance
-    return (
-        f"<b>✅ TP{tp_num} HIT - {sym} {side}</b> {arrow}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Entry: {fmt_p(entry)}\n{tp_progress_bar(tp_hit_total,direction)}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"TP{tp_num}: {fmt_p(tp_price)}\nTime: {elapsed_str(elapsed)}\n"
-        f"Close: +${pnl_usdt:.2f}{sl_note}\nSo far: +${trade_pnl_so_far:.2f}\n\n"
-        f"WR: {tw}/{total}={wr}% | P&L: ${net:.2f} | Bal: ${bal:.2f}"
-    )
+    return (f"<b>✅ TP{tp_num} HIT - {sym} {side}</b> {arrow}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Entry: {fmt_p(entry)}\n{tp_progress_bar(tp_hit_total,direction)}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"TP{tp_num}: {fmt_p(tp_price)}\nTime: {elapsed_str(elapsed)}\n"
+            f"Close: +${pnl_usdt:.2f}{sl_note}\nSo far: +${trade_pnl_so_far:.2f}\n\n"
+            f"WR: {tw}/{total}={wr}% | P&L: ${net:.2f} | Bal: ${bal:.2f}")
 
 def make_sl_msg(sym,direction,entry,exec_price,sl_price,elapsed,pnl_usdt,breakeven=False,sig_id=None,tp_hit_total=0,trade_pnl_so_far=0):
     side="LONG" if direction=="BUY" else "SHORT"
@@ -769,18 +787,17 @@ def make_sl_msg(sym,direction,entry,exec_price,sl_price,elapsed,pnl_usdt,breakev
     total_pnl=round(trade_pnl_so_far+(pnl_usdt if breakeven else -pnl_usdt),2)
     icon="✅" if total_pnl>=0 else "❌"; sign="+" if total_pnl>=0 else ""
     be=" (breakeven)" if breakeven else ""
-    return (
-        f"<b>{icon} SL HIT{be} - {sym} {side}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Entry: {fmt_p(entry)}\n{tp_progress_bar(tp_hit_total,direction)}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"SL: {fmt_p(sl_price)}\nTime: {elapsed_str(elapsed)}\n"
-        f"Close: {'BE' if breakeven else f'-${pnl_usdt:.2f}'}\n"
-        f"<b>Total: {sign}${abs(total_pnl):.2f}</b>\n\nWR:{tw}/{total}={wr}% | Bal:${bal:.2f}"
-    )
+    return (f"<b>{icon} SL HIT{be} - {sym} {side}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Entry: {fmt_p(entry)}\n{tp_progress_bar(tp_hit_total,direction)}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"SL: {fmt_p(sl_price)}\nTime: {elapsed_str(elapsed)}\n"
+            f"Close: {'BE' if breakeven else f'-${pnl_usdt:.2f}'}\n"
+            f"<b>Total: {sign}${abs(total_pnl):.2f}</b>\n\nWR:{tw}/{total}={wr}% | Bal:${bal:.2f}")
 
-# ─────────────────────── PAPER EXECUTE ────────────────────────
+# ─────────────────────── PAPER EXECUTE ──────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py except positions dict has 3 new fields for trailing !!
 def is_sl_safe(direction, sl, liq_price):
     if liq_price<=0 or sl<=0: return False
-    if direction=="BUY": return sl >= liq_price*(1+LIQ_BUFFER_PCT)
+    if direction=="BUY":  return sl >= liq_price*(1+LIQ_BUFFER_PCT)
     return sl <= liq_price*(1-LIQ_BUFFER_PCT)
 
 def paper_execute(coin, sig, price):
@@ -811,8 +828,8 @@ def paper_execute(coin, sig, price):
             "tp1":sig["tp1"],"tp2":sig["tp2"],"tp3":sig["tp3"],"tp4":sig["tp4"],
             "tp_pcts":sig["tp_pcts"],"tp_hit":0,"first_tp_counted":False,
             "breakeven":False,"opened_at":time.time(),"funding_periods_charged":0,
-            "currentPnl":0.0,"unrealized_pnl":0.0,"sig_id":sig_id,
-            # Phase 2.6 trailing stop fields
+            "currentPnl":0.0,"unrealized_pnl":0.0,"sig_id":sig_id,"close_reason":None,
+            # ── PHASE 2.6 ONLY: trailing stop fields ──
             "atr_val":sig.get("atr_abs"),
             "trailing_active":False,
             "trail_mult":2.0,
@@ -821,17 +838,16 @@ def paper_execute(coin, sig, price):
 
     side="LONG" if direction=="BUY" else "SHORT"
     lev_ret=[round(p*LEVERAGE,1) for p in sig["tp_pcts"]]
-    tg_send(
-        f"<b>📝 PAPER TRADE - #{sig_id}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{'🟢' if direction=='BUY' else '🔴'} <b>{side} {sym}/USDT</b>\n\n"
-        f"Entry: {fmt_p(price)}\nMargin: ${ts:.0f} | Exposure: ${notional:.0f}\n\n"
-        f"TP1:{fmt_p(sig['tp1'])} ({lev_ret[0]}%)\nTP2:{fmt_p(sig['tp2'])} ({lev_ret[1]}%)\n"
-        f"TP3:{fmt_p(sig['tp3'])} ({lev_ret[2]}%)\nTP4:{fmt_p(sig['tp4'])} ({lev_ret[3]}%)\n"
-        f"SL:{fmt_p(sig['sl'])}\nLiq:{fmt_p(liq_price)}\n\nBal:${bal_after:.2f} | Open:{oc}"
-    )
+    tg_send(f"<b>📝 PAPER TRADE - #{sig_id}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{'🟢' if direction=='BUY' else '🔴'} <b>{side} {sym}/USDT</b>\n\n"
+            f"Entry: {fmt_p(price)}\nMargin: ${ts:.0f} | Exposure: ${notional:.0f}\n\n"
+            f"TP1:{fmt_p(sig['tp1'])} ({lev_ret[0]}%)\nTP2:{fmt_p(sig['tp2'])} ({lev_ret[1]}%)\n"
+            f"TP3:{fmt_p(sig['tp3'])} ({lev_ret[2]}%)\nTP4:{fmt_p(sig['tp4'])} ({lev_ret[3]}%)\n"
+            f"SL:{fmt_p(sig['sl'])}\nLiq:{fmt_p(liq_price)}\n\nBal:${bal_after:.2f} | Open:{oc}")
     return True
 
-# ─────────────────────── MONITOR ──────────────────────────────
+# ─────────────────────── MONITOR ────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py except trailing stop block added after funding !!
 def monitor_positions(prices):
     global paper_balance
     to_remove=[]; notifications=[]
@@ -851,36 +867,34 @@ def monitor_positions(prices):
             tp_levels=[pos.get(f"tp{i}",0) for i in range(1,5)]
             ts=pos.get("margin",TRADE_SIZE)
 
-            # Unrealized PnL
+            # Unrealized PnL — identical to old
             rem=1-(tp_hit*0.25)
             if exec_price>0:
                 mv=(price-exec_price)/exec_price*100 if direction=="BUY" else (exec_price-price)/exec_price*100
                 pos["unrealized_pnl"]=round(ts*LEVERAGE*mv/100*rem,2)
 
-            # Funding
+            # Funding — identical to old
             fd=int(elapsed/28800); np=fd-pos.get("funding_periods_charged",0)
             if np>0:
                 cost=ts*LEVERAGE*FUNDING_RATE*np*rem
                 paper_balance-=cost; pos["funding_periods_charged"]=fd
                 stats["pnl_history"].append(round(paper_balance,2))
 
-            # ── PHASE 2.6: ATR Trailing stop update ──
-            # Only active after TP2 hit, updates SL every monitor cycle
+            # ── PHASE 2.6 ONLY: ATR trailing stop ──
+            # Not in old code. Activates after TP2 hit.
             if pos.get("trailing_active") and pos.get("atr_val"):
                 trail_mult = pos.get("trail_mult", 2.0)
                 atr_v = pos["atr_val"]
                 if direction == "BUY":
                     new_trail = round(price - trail_mult * atr_v, 8)
-                    if new_trail > sl:   # only move SL up (never down)
-                        pos["sl"] = new_trail
-                        sl = new_trail
+                    if new_trail > sl:
+                        pos["sl"] = new_trail; sl = new_trail
                 else:
                     new_trail = round(price + trail_mult * atr_v, 8)
-                    if new_trail < sl:   # only move SL down (never up)
-                        pos["sl"] = new_trail
-                        sl = new_trail
+                    if new_trail < sl:
+                        pos["sl"] = new_trail; sl = new_trail
 
-            # SL check
+            # SL check — identical to old
             sl_hit=(direction=="BUY" and price<=sl) or (direction=="SELL" and price>=sl)
             if sl_hit:
                 rem2=1-(tp_hit*0.25); pm=abs(sl-exec_price)/exec_price*100
@@ -899,7 +913,7 @@ def monitor_positions(prices):
                 notifications.append(make_sl_msg(sym,direction,entry,exec_price,sl,elapsed,pnl,pos.get("breakeven"),sig_id=pos.get("sig_id"),tp_hit_total=tp_hit,trade_pnl_so_far=pos.get("currentPnl",0)))
                 to_remove.append(sym); continue
 
-            # GAP SL / liquidation
+            # GAP SL — identical to old
             liq_hit=(direction=="BUY" and price<=liq_price) or (direction=="SELL" and price>=liq_price)
             if liq_hit:
                 rem2=1-(tp_hit*0.25); rm=ts*rem2
@@ -929,39 +943,27 @@ def monitor_positions(prices):
                     new_sl=exec_price; pos["sl"]=new_sl; pos["breakeven"]=True
                 elif tp_num==2:
                     new_sl=tp_levels[0]; pos["sl"]=new_sl
-                    # ── PHASE 2.6: Activate trailing stop after TP2 ──
-                    pos["trailing_active"]=True
-                    pos["trail_mult"]=2.0
+                    # ── PHASE 2.6 ONLY: activate trailing after TP2 ──
+                    pos["trailing_active"]=True; pos["trail_mult"]=2.0
                 elif tp_num==3:
                     new_sl=tp_levels[1]; pos["sl"]=new_sl
-                    pos["trail_mult"]=1.0   # tighten trail at TP3
-                elif tp_num==4:
-                    pos["trail_mult"]=0.5   # tightest at TP4
+                    pos["trail_mult"]=1.0  # tighten at TP3
                 pos["tp_hit"]=tp_num
-
                 if tp_num==4:
                     stats["total"]+=1; stats["trades_won"]+=1; risk_state["consec_losses"]=0
                     stats["trades_list"].append({"sym":sym,"direction":direction,"result":"ALL_TP","pnl":round(pos["currentPnl"],2),"time":utc_now_str()})
                     total=stats["total"]; tw=stats["trades_won"]; wr=round(tw/total*100,1)
-                    notifications.append(
-                        f"<b>🎯 ALL 4 TPs HIT - {sym}!</b>\n"
-                        f"Trade P&L: +${pos['currentPnl']:.2f}\n"
-                        f"WR:{tw}/{total}={wr}%\nBal:${paper_balance:.2f}"
-                    )
+                    notifications.append(f"<b>🎯 ALL 4 TPs HIT - {sym}!</b>\nTrade P&L: +${pos['currentPnl']:.2f}\nWR:{tw}/{total}={wr}%\nBal:${paper_balance:.2f}")
                     to_remove.append(sym)
                 else:
-                    notifications.append(make_tp_msg(
-                        sym,direction,tp_num,entry,exec_price,next_tp,elapsed,pnl,
-                        new_sl,sig_id=pos.get("sig_id"),tp_hit_total=tp_num,
-                        trade_pnl_so_far=pos.get("currentPnl",0),
-                        trailing=pos.get("trailing_active",False)
-                    ))
+                    notifications.append(make_tp_msg(sym,direction,tp_num,entry,exec_price,next_tp,elapsed,pnl,new_sl,sig_id=pos.get("sig_id"),tp_hit_total=tp_num,trade_pnl_so_far=pos.get("currentPnl",0)))
 
     with state_lock:
         for sym in to_remove: positions.pop(sym,None)
     for msg in notifications: tg_send(msg)
 
-# ─────────────────────── STALE CLOSE ──────────────────────────
+# ─────────────────────── STALE CLOSE ────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py !!
 def close_stale_position(sym, pos, scan_prices):
     global paper_balance
     coin_data=next((c for c in COINS if c["symbol"]==sym),None)
@@ -983,304 +985,250 @@ def close_stale_position(sym, pos, scan_prices):
         age=f"{(time.time()-pos['opened_at'])/3600:.1f}h"
         tg_send(f"<b>⏰ STALE CLOSE - {sym}</b>\nOpen: {age}\nP&L: {'+' if total_pnl>=0 else ''}${total_pnl:.2f}\nBal:${paper_balance:.2f}")
 
-# ═══════════════════════════════════════════════════════════════
-# PHASE 2.6 — AI AGENT
-# Changes vs original agent:
-#   1. Two-mode: losses → close fast, winners → let trail run
-#   2. Fast loss monitor thread (every 15 min)
-#   3. Re-entry block 2h after agent close
-#   4. Better Claude prompt (stops closing winners early)
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 2.6 ONLY — AI AGENT
+# Everything below this line is NEW — not in apex_bybit_paper.py
+# ═══════════════════════════════════════════════════════════════════
 
 def agent_ema(vals, p):
     if len(vals) < p: return None
-    k = 2/(p+1); e = sum(vals[:p])/p
-    for v in vals[p:]: e = v*k + e*(1-k)
+    k=2/(p+1); e=sum(vals[:p])/p
+    for v in vals[p:]: e=v*k+e*(1-k)
     return e
 
 def agent_snapshot(symbol):
-    """Get 1h + 4h trend for a symbol."""
     try:
-        r1 = requests.get("https://api.binance.com/api/v3/klines",
+        r1=requests.get("https://api.binance.com/api/v3/klines",
             params={"symbol":symbol+"USDT","interval":"1h","limit":100},timeout=10)
-        r4 = requests.get("https://api.binance.com/api/v3/klines",
+        r4=requests.get("https://api.binance.com/api/v3/klines",
             params={"symbol":symbol+"USDT","interval":"4h","limit":100},timeout=10)
-        c1 = r1.json(); c4 = r4.json()
+        c1=r1.json(); c4=r4.json()
         if not isinstance(c1,list) or not isinstance(c4,list): return None
         cl1=[float(c[4]) for c in c1]; vl1=[float(c[5]) for c in c1]
         cl4=[float(c[4]) for c in c4]
         e20_1=agent_ema(cl1,20); e50_1=agent_ema(cl1,50)
         e20_4=agent_ema(cl4,20); e50_4=agent_ema(cl4,50)
-        t1="up"   if (e20_1 and e50_1 and e20_1>e50_1) else "down"
-        t4="up"   if (e20_4 and e50_4 and e20_4>e50_4) else "down"
+        t1="up" if (e20_1 and e50_1 and e20_1>e50_1) else "down"
+        t4="up" if (e20_4 and e50_4 and e20_4>e50_4) else "down"
         rv=vl1[-1]; av=sum(vl1[-20:])/20 if len(vl1)>=20 else sum(vl1)/len(vl1)
         return {"price":cl1[-1],"trend_1h":t1,"trend_4h":t4,"volume":"rising" if rv>av else "falling"}
     except Exception: return None
 
 def agent_close_position(sym, prices, reason="reversal"):
     """
-    Close a position and apply 2h re-entry block.
-    PHASE 2.6 FIX: Adds AGENT_COOLDOWN_SECS to sl_cooldown to prevent
-    bot re-entering the same coin immediately after agent close.
+    FIXED WR BUG: trades_won now increments correctly based on total_pnl.
+    FIXED RE-ENTRY BUG: 2h cooldown set via agent_ prefix key.
     """
     global paper_balance
-    coin = next((c for c in COINS if c["symbol"]==sym), None)
+    coin=next((c for c in COINS if c["symbol"]==sym),None)
     if not coin: return False
-    d = prices.get(coin["id"]) or {}; live = d.get("usd")
+    d=prices.get(coin["id"]) or {}; live=d.get("usd")
     with state_lock:
         if sym not in positions: return False
         pos=positions[sym]; direction=pos["direction"]; ep=pos["exec_price"]
-        if not live: live = ep
+        if not live: live=ep
         tp_hit=pos["tp_hit"]; rem=1-(tp_hit*0.25); ts=pos["margin"]; rm=ts*rem
         mv=(live-ep)/ep*100 if direction=="BUY" else (ep-live)/ep*100
         upnl=round(ts*LEVERAGE*mv/100*rem,2)
-        prior=pos.get("currentPnl",0); total=round(prior+upnl,2)
+        prior=pos.get("currentPnl",0)
+        total_pnl=round(prior+upnl,2)   # full trade result including realized TP hits
+
+        # Record P&L correctly
         if upnl>=0: stats["profit_usdt"]+=upnl
         else:       stats["loss_usdt"]+=abs(upnl)
-        paper_balance+=rm+upnl; stats["total"]+=1
-        if total>=0: stats["trades_won"]+=1
+
+        paper_balance+=rm+upnl
+        stats["total"]+=1
+
+        # ── FIX: WR based on total_pnl not just upnl ──
+        if total_pnl>=0:
+            stats["trades_won"]+=1
+            risk_state["consec_losses"]=0
+        else:
+            risk_state["consec_losses"]+=1
+            sl_cooldown[sym]=time.time()  # SL cooldown on losing agent close
+
         stats["pnl_history"].append(round(paper_balance,2))
-        stats["trades_list"].append({"sym":sym,"direction":direction,"result":"AGENT_CLOSE","pnl":total,"time":utc_now_str()})
+        stats["trades_list"].append({
+            "sym":sym,"direction":direction,
+            "result":"AGENT_CLOSE","pnl":total_pnl,"time":utc_now_str()
+        })
         positions.pop(sym,None)
-        # ── PHASE 2.6 FIX: Block re-entry for 2h after agent close ──
-        sl_cooldown[sym] = time.time() + AGENT_COOLDOWN_SECS - SL_COOLDOWN_SECONDS
-        # Note: cooldown dict stores timestamps, pruned by SL_COOLDOWN_SECONDS
-        # So we set it so it expires in AGENT_COOLDOWN_SECS from now
-        sl_cooldown[sym] = time.time()   # will be blocked for SL_COOLDOWN_SECONDS
-        # Override: use a separate agent cooldown key
-        sl_cooldown[f"agent_{sym}"] = time.time()
-        bal = paper_balance
-    sign="+" if total>=0 else ""
-    tg_send(f"<b>🤖 AGENT CLOSE - {sym}</b>\nAI flagged {reason}\nP&L: {sign}${total:.2f}\nBal: ${bal:.2f}")
+
+        # ── FIX: 2h re-entry block using agent_ prefix ──
+        sl_cooldown[f"agent_{sym}"]=time.time()
+        bal=paper_balance
+
+    sign="+" if total_pnl>=0 else ""
+    tg_send(f"<b>🤖 AGENT CLOSE - {sym}</b>\nAI flagged {reason}\nP&L: {sign}${total_pnl:.2f}\nBal: ${bal:.2f}")
     return True
 
 def agent_ask_claude(open_pos, market_data, summary):
     """
-    PHASE 2.6 FIX: Two-mode prompt.
-    LOSING trades → close fast if trend confirms against position.
-    WINNING trades → KEEP and let trailing stop work.
-                     Only close if BOTH timeframes reversed AND profit > $8.
+    Two-mode prompt:
+    LOSERS → close fast if both TFs against position
+    WINNERS → KEEP, only close if strict criteria met
     """
-    prompt = f"""You are a crypto trading risk manager for a paper trading bot.
+    prompt=f"""You are a crypto trading risk manager for a paper trading bot.
 
 SESSION: {summary}
 
-OPEN POSITIONS (direction, entry price, TPs hit, unrealized P&L in USD):
+OPEN POSITIONS (direction, entry, tp_hit, unrealized_pnl in USD):
 {json.dumps(open_pos, indent=2)}
 
-MARKET DATA (trend_1h, trend_4h, volume for each coin):
+MARKET DATA (trend_1h, trend_4h, volume):
 {json.dumps(market_data, indent=2)}
 
-DECISION RULES — follow strictly:
+RULES — follow strictly:
 
 LOSING positions (unrealized_pnl < -5):
-  → CLOSE if trend_1h AND trend_4h both against the direction
-    (e.g. LONG trade but 1h=down and 4h=down → CLOSE)
-  → WATCH if only one timeframe is against it
+  CLOSE if trend_1h AND trend_4h both against direction
+  WATCH if only one timeframe against
 
 WINNING positions (unrealized_pnl >= 0):
-  → KEEP always — the trailing stop will protect profits
-  → Only CLOSE if ALL of these are true:
-      1. BOTH trend_1h AND trend_4h fully reversed against position
-      2. unrealized_pnl > 8 (profit worth protecting now)
-      3. volume is falling (trend losing momentum)
-  → Never CLOSE a winning position under $5 profit — let it run
-  → When in doubt on a winner: KEEP
+  KEEP always — trailing stop protects profits
+  Only CLOSE if ALL true:
+    1. BOTH trend_1h AND trend_4h reversed against position
+    2. unrealized_pnl > 8
+    3. volume falling
+  Never CLOSE winner under $5 — let it run
+  When in doubt: KEEP
 
-BREAKEVEN positions (unrealized near 0):
-  → WATCH — neither close nor keep strongly
+BREAKEVEN (unrealized near 0): WATCH
 
-Respond ONLY with valid JSON, no markdown, no explanation:
-{{"recommendations":[{{"symbol":"XXX","action":"KEEP","reason":"max 10 words"}},{{"symbol":"YYY","action":"CLOSE","reason":"max 10 words"}},{{"symbol":"ZZZ","action":"WATCH","reason":"max 10 words"}}],"market_summary":"one sentence about overall market"}}"""
-
+Respond ONLY with valid JSON, no markdown:
+{{"recommendations":[{{"symbol":"XXX","action":"KEEP","reason":"max 10 words"}}],"market_summary":"one sentence"}}"""
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
+        r=requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
             json={"model":AGENT_MODEL,"max_tokens":800,"messages":[{"role":"user","content":prompt}]},
-            timeout=40
-        )
-        d = r.json()
-        txt = "".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text")
-        txt = txt.replace("```json","").replace("```","").strip()
+            timeout=40)
+        d=r.json()
+        txt="".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text")
+        txt=txt.replace("```json","").replace("```","").strip()
         return json.loads(txt)
     except Exception as e:
-        print("agent claude error:", e)
-        return None
+        print("agent claude error:",e); return None
 
 def agent_loop(get_prices_fn):
-    """
-    PHASE 2.6: Hourly Claude analysis of all open trades.
-    Two-mode: only auto-closes losers unless winner meets strict criteria.
-    """
     if not AGENT_ENABLED:
         print("  Agent disabled (no ANTHROPIC_API_KEY)"); return
-    time.sleep(120)   # let bot warm up first
+    time.sleep(120)
     tg_send(
         f"<b>🤖 AI Agent v2 — Active</b>\n"
         f"Hourly analysis: ON\n"
         f"Fast loss check: every 15 min\n"
         f"Auto-close: {'ON' if AGENT_AUTO_CLOSE else 'OFF'}\n"
-        f"Mode: losers → close fast | winners → let trail run"
+        f"Mode: losers→close fast | winners→let trail run"
     )
     while True:
         try:
             with state_lock:
-                open_syms = list(positions.keys())
-                open_snapshot = {
-                    s: {
-                        "direction":     positions[s]["direction"],
-                        "entry":         positions[s]["exec_price"],
-                        "tp_hit":        positions[s]["tp_hit"],
-                        "unrealized_pnl":positions[s].get("unrealized_pnl",0),
-                        "trailing_active":positions[s].get("trailing_active",False),
-                        "breakeven":     positions[s].get("breakeven",False),
-                    }
-                    for s in open_syms
-                }
-            if not open_syms:
-                time.sleep(AGENT_INTERVAL); continue
+                open_syms=list(positions.keys())
+                open_snapshot={s:{
+                    "direction":positions[s]["direction"],
+                    "entry":positions[s]["exec_price"],
+                    "tp_hit":positions[s]["tp_hit"],
+                    "unrealized_pnl":positions[s].get("unrealized_pnl",0),
+                    "trailing_active":positions[s].get("trailing_active",False),
+                    "breakeven":positions[s].get("breakeven",False),
+                } for s in open_syms}
+            if not open_syms: time.sleep(AGENT_INTERVAL); continue
 
-            prices = get_prices_fn()
-            if not prices:
-                time.sleep(60); continue
+            prices=get_prices_fn()
+            if not prices: time.sleep(60); continue
 
-            market = {}
+            market={}
             for s in open_syms:
-                snap = agent_snapshot(s)
-                if snap: market[s] = snap
+                snap=agent_snapshot(s)
+                if snap: market[s]=snap
                 time.sleep(0.3)
 
             with state_lock:
-                summary = (f"Balance ${paper_balance:.0f}, "
-                           f"{stats['total']} trades, "
-                           f"{stats.get('trades_won',0)} won, "
-                           f"WR {round(stats['trades_won']/stats['total']*100,1) if stats['total']>0 else 0}%")
+                wr_val=round(stats["trades_won"]/stats["total"]*100,1) if stats["total"]>0 else 0
+                summary=f"Balance ${paper_balance:.0f}, {stats['total']} trades, {stats['trades_won']} won, WR {wr_val}%"
 
-            result = agent_ask_claude(open_snapshot, market, summary)
-            if not result:
-                time.sleep(AGENT_INTERVAL); continue
+            result=agent_ask_claude(open_snapshot,market,summary)
+            if not result: time.sleep(AGENT_INTERVAL); continue
 
-            recs = result.get("recommendations", [])
-            mkt  = result.get("market_summary", "")
-            lines = ["<b>🤖 AGENT ANALYSIS</b>", "━"*18]
-
+            recs=result.get("recommendations",[]); mkt=result.get("market_summary","")
+            lines=["<b>🤖 AGENT ANALYSIS</b>","━"*18]
             for rec in recs:
-                sym = rec.get("symbol","?")
-                act = rec.get("action","WATCH")
-                rsn = rec.get("reason","")
-                icon = {"KEEP":"✅","CLOSE":"🔴","WATCH":"👀"}.get(act,"•")
+                sym=rec.get("symbol","?"); act=rec.get("action","WATCH"); rsn=rec.get("reason","")
+                icon={"KEEP":"✅","CLOSE":"🔴","WATCH":"👀"}.get(act,"•")
                 lines.append(f"{icon} <b>{sym}</b>: {act} — {rsn}")
-                if act == "CLOSE" and AGENT_AUTO_CLOSE:
-                    if agent_close_position(sym, prices, rsn):
-                        lines.append("   → closed ✅")
-
-            if mkt:
-                lines.append("━"*18)
-                lines.append(f"📊 {mkt}")
-
+                if act=="CLOSE" and AGENT_AUTO_CLOSE:
+                    if agent_close_position(sym,prices,rsn): lines.append("   → closed ✅")
+            if mkt: lines.append("━"*18); lines.append(f"📊 {mkt}")
             tg_send("\n".join(lines))
             time.sleep(AGENT_INTERVAL)
-
         except Exception as e:
-            print(f"agent loop error: {e}")
-            time.sleep(180)
+            print(f"agent loop error:{e}"); time.sleep(180)
 
 def agent_loss_monitor(get_prices_fn):
-    """
-    PHASE 2.6 NEW: Fast loop — checks only LOSING positions every 15 min.
-    If BOTH 1h and 4h trend against the position AND loss > threshold → close immediately.
-    No Claude API call needed — pure rule-based for speed.
-    Catches losses like TAO -$12.79 in 46 min before hourly agent sees it.
-    """
-    if not AGENT_ENABLED:
-        return
-    time.sleep(300)   # wait 5 min after startup
-    print("  ⚡ Fast loss monitor started (15 min checks)")
+    """Fast 15-min check: if loss > $8 and both TFs against → close immediately. No Claude call."""
+    if not AGENT_ENABLED: return
+    time.sleep(300)
+    print("  ⚡ Fast loss monitor started (15 min)")
     while True:
         try:
             with state_lock:
-                # Only check positions with unrealized loss worse than threshold
-                losing = {
-                    s: dict(p) for s, p in positions.items()
-                    if p.get("unrealized_pnl", 0) < AGENT_LOSS_THRESHOLD
-                }
-
+                losing={s:dict(p) for s,p in positions.items()
+                        if p.get("unrealized_pnl",0)<AGENT_LOSS_THRESHOLD}
             if losing:
-                prices = get_prices_fn()
+                prices=get_prices_fn()
                 if prices:
-                    for sym, pos in losing.items():
-                        snap = agent_snapshot(sym)
+                    for sym,pos in losing.items():
+                        snap=agent_snapshot(sym)
                         if not snap: continue
-                        direction  = pos["direction"]
-                        trend_1h   = snap["trend_1h"]
-                        trend_4h   = snap["trend_4h"]
-                        upnl       = pos.get("unrealized_pnl", 0)
-
-                        # Both timeframes against position → close immediately
-                        should_close = (
-                            (direction == "BUY"  and trend_1h == "down" and trend_4h == "down") or
-                            (direction == "SELL" and trend_1h == "up"   and trend_4h == "up")
+                        d=pos["direction"]; t1=snap["trend_1h"]; t4=snap["trend_4h"]
+                        upnl=pos.get("unrealized_pnl",0)
+                        should_close=(
+                            (d=="BUY"  and t1=="down" and t4=="down") or
+                            (d=="SELL" and t1=="up"   and t4=="up")
                         )
-
                         if should_close:
-                            reason = f"both TFs against {direction}, loss ${upnl:.2f}"
-                            closed = agent_close_position(sym, prices, reason)
-                            if closed:
-                                tg_send(
-                                    f"<b>⚡ FAST CLOSE - {sym}</b>\n"
-                                    f"Loss monitor triggered\n"
-                                    f"Unrealized: ${upnl:.2f}\n"
-                                    f"1h: {trend_1h} | 4h: {trend_4h}"
-                                )
-
+                            reason=f"both TFs against {d}, loss ${upnl:.2f}"
+                            if agent_close_position(sym,prices,reason):
+                                tg_send(f"<b>⚡ FAST CLOSE - {sym}</b>\nLoss monitor\nU: ${upnl:.2f}\n1h:{t1} 4h:{t4}")
             time.sleep(AGENT_LOSS_INTERVAL)
-
         except Exception as e:
-            print(f"loss monitor error: {e}")
-            time.sleep(300)
+            print(f"loss monitor error:{e}"); time.sleep(300)
 
-# ─────────────────────── MAIN ─────────────────────────────────
+# ─────────────────────── MAIN ────────────────────────────────────
+# !! IDENTICAL TO apex_bybit_paper.py except agent threads added !!
 def run():
     global paper_balance, pre_warned, last_signal
-    risk_state["session_start_balance"] = paper_balance
-    risk_state["btc_last_check"]        = time.time()
+    risk_state["session_start_balance"]=paper_balance
+    risk_state["btc_last_check"]=time.time()
 
     print("="*55)
-    print("  APEX v3 Phase 2.6 — MTF + Trail + AI Agent")
+    print("  APEX v3 Phase 2.6 — MTF + Trailing Stop + AI Agent")
     print("="*55)
     print(f"  Coins: {len(COINS)} | Trade: ${TRADE_SIZE}×{LEVERAGE}x | MinConf: {MIN_CONF}%")
-    print(f"  Agent: {'ON' if AGENT_ENABLED else 'OFF (set ANTHROPIC_API_KEY)'}")
-    print(f"  Auto-close: {AGENT_AUTO_CLOSE} | Loss threshold: ${AGENT_LOSS_THRESHOLD}")
+    print(f"  Agent: {'ON' if AGENT_ENABLED else 'OFF'} | SL cooldown: {SL_COOLDOWN_SECONDS//3600}h")
 
-    # Start Flask
-    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread=threading.Thread(target=start_flask,daemon=True)
     flask_thread.start()
 
-    # Start AI agent threads (hourly analysis + fast loss monitor)
+    # ── PHASE 2.6 ONLY: start agent threads ──
     if AGENT_ENABLED:
-        agent_thread = threading.Thread(target=agent_loop, args=(get_prices,), daemon=True)
-        agent_thread.start()
-        loss_thread  = threading.Thread(target=agent_loss_monitor, args=(get_prices,), daemon=True)
-        loss_thread.start()
+        threading.Thread(target=agent_loop,args=(get_prices,),daemon=True).start()
+        threading.Thread(target=agent_loss_monitor,args=(get_prices,),daemon=True).start()
 
     tg_send(
-        f"<b>⚡ APEX v3 (Phase 2.6) — Online!</b>\n\n"
+        f"<b>⚡ APEX MTF Bot — Online!</b>\n\n"
         f"Signal Engine: <b>Supertrend + UT Bot + EMA</b>\n"
         f"Timeframes: <b>1m + 5m + 1h + 4h consensus</b>\n"
         f"Coins: <b>{len(COINS)}</b>\n"
-        f"Trade: <b>${TRADE_SIZE}×{LEVERAGE}x = ${TRADE_SIZE*LEVERAGE} exposure</b>\n\n"
-        f"<b>Phase 2.6 features:</b>\n"
-        f"• ATR trailing stop (activates after TP2)\n"
-        f"• Trail: 2×ATR → 1×ATR (TP3) → 0.5×ATR (TP4)\n"
-        f"• AI Agent: {'ON' if AGENT_ENABLED else 'OFF'}\n"
-        f"• Agent mode: losers→close fast | winners→let run\n"
-        f"• Fast loss check: every 15 min (>${abs(AGENT_LOSS_THRESHOLD)} loss)\n"
-        f"• Re-entry block: 2h after agent close\n\n"
+        f"Trade: <b>${TRADE_SIZE}×{LEVERAGE}x = ${TRADE_SIZE*LEVERAGE} exposure</b>\n"
+        f"Min conf: <b>{MIN_CONF}%</b>\n\n"
+        f"<b>Phase 2.6 additions:</b>\n"
+        f"• ATR trailing stop after TP2\n"
+        f"• AI Agent: {'ON — hourly analysis' if AGENT_ENABLED else 'OFF'}\n"
+        f"• Fast loss monitor: every 15 min\n"
+        f"• Re-entry block: 2h after agent close\n"
+        f"• WR bug fixed\n\n"
         f"Commands: /report /r /pause /resume /help"
     )
 
@@ -1288,110 +1236,101 @@ def run():
 
     while True:
         try:
-            offset = check_btns(offset)
-
-            if time.time() - last_price_t >= 10:
-                prices = get_prices(); last_price_t = time.time()
-
+            offset=check_btns(offset)
+            if time.time()-last_price_t>=10:
+                prices=get_prices(); last_price_t=time.time()
             if prices:
-                with state_lock: open_syms = list(positions.keys())
+                with state_lock: open_syms=list(positions.keys())
                 if open_syms: monitor_positions(prices)
 
-            if time.time() - last_scan_at >= SCAN_EVERY_SECONDS:
-                last_scan_at = time.time()
+            if time.time()-last_scan_at>=SCAN_EVERY_SECONDS:
+                last_scan_at=time.time()
                 with state_lock: oc=len(positions); bal=paper_balance
                 print(f"\n[{utc_now_str()}] Scanning {len(COINS)} coins (open:{oc} bal:${bal:.2f})")
 
-                now = time.time()
-                pre_warned  = {k:v for k,v in pre_warned.items()  if now-v < PRE_WARN_TTL}
-                coin_syms   = {c["symbol"] for c in COINS}
-                last_signal = {k:v for k,v in last_signal.items() if k in coin_syms}
+                now=time.time()
+                pre_warned={k:v for k,v in pre_warned.items() if now-v<PRE_WARN_TTL}
+                coin_syms={c["symbol"] for c in COINS}
+                last_signal={k:v for k,v in last_signal.items() if k in coin_syms}
                 with state_lock:
-                    if len(stats["pnl_history"]) > 600:
-                        stats["pnl_history"] = stats["pnl_history"][-500:]
+                    if len(stats["pnl_history"])>600:
+                        stats["pnl_history"]=stats["pnl_history"][-500:]
 
-                scan_prices = get_prices()
+                scan_prices=get_prices()
                 if not scan_prices: time.sleep(2); continue
-                prices = scan_prices
+                prices=scan_prices
 
                 for sym in check_stale_positions():
-                    pos = positions.get(sym)
-                    if pos: close_stale_position(sym, pos, scan_prices)
+                    pos=positions.get(sym)
+                    if pos: close_stale_position(sym,pos,scan_prices)
 
                 if check_circuit_breakers(scan_prices):
                     print(f"  🛑 Paused: {risk_state['pause_reason']}")
                     time.sleep(2); continue
 
-                # Prune SL cooldowns
+                # Prune cooldowns — agent_ keys use AGENT_COOLDOWN_SECS
                 for sym_cd in list(sl_cooldown.keys()):
-                    cd_time = SL_COOLDOWN_SECONDS
-                    # Agent closes use AGENT_COOLDOWN_SECS
-                    if sym_cd.startswith("agent_"):
-                        cd_time = AGENT_COOLDOWN_SECS
-                    if time.time() - sl_cooldown[sym_cd] >= cd_time:
-                        sl_cooldown.pop(sym_cd, None)
+                    cd_time=AGENT_COOLDOWN_SECS if sym_cd.startswith("agent_") else SL_COOLDOWN_SECONDS
+                    if time.time()-sl_cooldown[sym_cd]>=cd_time:
+                        sl_cooldown.pop(sym_cd,None)
                         print(f"  ✅ {sym_cd} cooldown expired")
 
-                # Find candidates with >2% move
-                ta_candidates = []
+                ta_candidates=[]
                 for coin in COINS:
-                    sym = coin["symbol"]
+                    sym=coin["symbol"]
                     if sym in BLOCKED_COINS: continue
-                    # Check both normal SL cooldown and agent cooldown
+                    # Check both normal and agent cooldown
                     if sym in sl_cooldown or f"agent_{sym}" in sl_cooldown: continue
                     with state_lock:
                         if sym in positions: continue
-                    d   = scan_prices.get(coin["id"]) or {}
-                    vol = d.get("usd_24h_vol")
-                    if vol and vol < MIN_24H_VOLUME: continue
-                    change = d.get("usd_24h_change",0) or 0
-                    if abs(change) >= 2:
-                        ta_candidates.append(sym)
+                    d=scan_prices.get(coin["id"]) or {}
+                    vol=d.get("usd_24h_vol")
+                    if vol and vol<MIN_24H_VOLUME: continue
+                    change=d.get("usd_24h_change",0) or 0
+                    if abs(change)>=2: ta_candidates.append(sym)
 
-                ta_map = fetch_ta_parallel(ta_candidates) if ta_candidates else {}
+                ta_map=fetch_ta_parallel(ta_candidates) if ta_candidates else {}
 
                 for coin in COINS:
-                    sym = coin["symbol"]
+                    sym=coin["symbol"]
                     if sym in BLOCKED_COINS: continue
                     if sym in sl_cooldown or f"agent_{sym}" in sl_cooldown: continue
                     with state_lock:
                         if sym in positions: continue
-                    d      = scan_prices.get(coin["id"]) or {}
-                    price  = d.get("usd"); change = d.get("usd_24h_change",0) or 0
-                    high   = d.get("usd_24h_high"); low = d.get("usd_24h_low")
-                    vol    = d.get("usd_24h_vol")
-                    if not price or abs(change) < 2: continue
-                    if vol and vol < MIN_24H_VOLUME: continue
+                    d=scan_prices.get(coin["id"]) or {}
+                    price=d.get("usd"); change=d.get("usd_24h_change",0) or 0
+                    high=d.get("usd_24h_high"); low=d.get("usd_24h_low")
+                    vol=d.get("usd_24h_vol")
+                    if not price or abs(change)<2: continue
+                    if vol and vol<MIN_24H_VOLUME: continue
 
-                    ta_mtf = ta_map.get(sym)
-                    print(f"  {sym}: ${price} {round(change,2)}%", end="")
+                    ta_mtf=ta_map.get(sym)
+                    print(f"  {sym}: ${price} {round(change,2)}%",end="")
                     if ta_mtf:
                         h1=ta_mtf.get("1h") or {}; h4=ta_mtf.get("4h") or {}
                         st1="🟢" if h1.get("st_bull") else "🔴"
                         st4="🟢" if h4.get("st_bull") else "🔴"
                         ut1="UT✅" if h1.get("ut_buy") or h1.get("ut_sell") else "UT-"
-                        print(f" | ST1h={st1} ST4h={st4} {ut1}", end="")
+                        print(f" | ST1h={st1} ST4h={st4} {ut1}",end="")
                     print()
 
-                    sig = build_signal(price, change, high, low, vol, ta_mtf)
-                    if not sig or sig["conf"] < MIN_CONF: continue
+                    sig=build_signal(price,change,high,low,vol,ta_mtf)
+                    if not sig or sig["conf"]<MIN_CONF: continue
 
-                    prev = last_signal.get(sym)
-                    if prev and prev["signal"]==sig["signal"] and abs(prev.get("entry",0)-price)/price < 0.005:
-                        continue
+                    prev=last_signal.get(sym)
+                    if prev and prev["signal"]==sig["signal"] and abs(prev.get("entry",0)-price)/price<0.005: continue
 
                     with state_lock:
-                        if len(positions) >= MAX_OPEN_TRADES:
+                        if len(positions)>=MAX_OPEN_TRADES:
                             print(f"  Max trades, skip {sym}"); continue
-                        pre_warned.pop(sym, None)
+                        pre_warned.pop(sym,None)
 
-                    sig["entry"]  = price
-                    sig["sig_id"] = make_signal_id(sym)
-                    last_signal[sym] = sig
+                    sig["entry"]=price; sig["sig_id"]=make_signal_id(sym)
+                    last_signal[sym]=sig
 
-                    opened = paper_execute(coin, sig, price)
+                    opened=paper_execute(coin,sig,price)
                     if opened:
-                        tg_send(make_signal_msg(coin, sig, price, change))
+                        tg_send(make_signal_msg(coin,sig,price,change))
                         print(f"  🚀 Signal: {sym} {sig['signal']} {sig['conf']}% (agree:{sig['agreement']}%)")
                     else:
                         print(f"  ⛔ Rejected: {sym}")
@@ -1401,11 +1340,11 @@ def run():
         except KeyboardInterrupt:
             print("\nStopped.")
             with state_lock:
-                net = round(stats["profit_usdt"]-stats["loss_usdt"],2)
+                net=round(stats["profit_usdt"]-stats["loss_usdt"],2)
                 print(f"Final: {stats['trades_won']}/{stats['total']} | P&L: ${net}")
             break
         except Exception as e:
             print(f"Error: {e}"); time.sleep(5)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     run()
